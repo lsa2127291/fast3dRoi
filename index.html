@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="高精度医疗图像可视化系统 - MPR 三视图 + 3D 体渲染" />
+  <title>Medical Imaging Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+  <div class="app-container">
+    <!-- 头部 -->
+    <header class="header">
+      <h1>Medical Imaging Viewer</h1>
+      <div class="header-actions">
+        <label for="file-input" class="btn btn-primary">📂 加载文件</label>
+        <input type="file" id="file-input" multiple accept=".dcm,.nii,.nii.gz" />
+      </div>
+    </header>
+
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+      <!-- 窗宽窗位 -->
+      <div class="panel">
+        <div class="panel-title">窗宽窗位</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>窗宽 (WW)</label>
+            <input type="number" id="window-width" value="400" />
+          </div>
+          <div class="form-group">
+            <label>窗位 (WC)</label>
+            <input type="number" id="window-center" value="40" />
+          </div>
+        </div>
+        <button id="apply-window" class="btn btn-secondary" style="width: 100%;">应用</button>
+      </div>
+
+      <!-- 笔刷工具 -->
+      <div class="panel">
+        <div class="panel-title">勾画工具</div>
+        <div class="form-group">
+          <label>选择 ROI</label>
+          <select id="roi-select">
+            <option value="1">ROI 1 - 红色</option>
+            <option value="2">ROI 2 - 绿色</option>
+            <option value="3">ROI 3 - 蓝色</option>
+            <option value="4">ROI 4 - 黄色</option>
+            <option value="5">ROI 5 - 紫色</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>笔刷大小: <span id="brush-size-label">5</span></label>
+          <input type="range" id="brush-size" min="1" max="50" value="5" />
+        </div>
+        <div class="checkbox-group">
+          <input type="checkbox" id="erase-mode" />
+          <label for="erase-mode">擦除模式</label>
+        </div>
+        <p style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 12px;">
+          提示: 按住 Ctrl + 鼠标左键 在视图中勾画
+        </p>
+      </div>
+
+      <!-- 统计信息 -->
+      <div class="panel">
+        <div class="panel-title">信息</div>
+        <div id="stats-info" style="font-size: 0.75rem; color: var(--text-secondary);">
+          等待加载数据...
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主内容 - MPR 视图 -->
+    <main class="main-content">
+      <div id="axial-view" class="view-panel">
+        <div class="view-label">Axial (轴位)</div>
+      </div>
+      <div id="sagittal-view" class="view-panel">
+        <div class="view-label">Sagittal (矢状位)</div>
+      </div>
+      <div id="coronal-view" class="view-panel">
+        <div class="view-label">Coronal (冠状位)</div>
+      </div>
+      <div id="volume-view" class="view-panel">
+        <div class="view-label">3D Volume</div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 加载遮罩 -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">
+      <span id="loading-progress">加载中...</span>
+    </div>
+  </div>
+
+  <!-- dcmjs CDN -->
+  <script src="https://unpkg.com/dcmjs@0.34.0/build/dcmjs.js"></script>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
+</html>

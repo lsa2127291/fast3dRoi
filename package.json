@@ -1,0 +1,24 @@
+{
+  "name": "medical-imaging-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:perf": "vitest run --reporter=verbose perf"
+  },
+  "dependencies": {
+    "@kitware/vtk.js": "^30.5.0",
+    "dcmjs": "^0.34.0",
+    "nifti-reader-js": "^0.6.8"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3",
+    "typescript": "^5.7.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}
