@@ -14,6 +14,7 @@ export default defineConfig({
     build: {
         target: 'esnext',
     },
+    assetsInclude: ['**/*.wgsl'],
     optimizeDeps: {
         include: ['@kitware/vtk.js'],
     },

@@ -5,7 +5,6 @@
 
 import type { VolumeData, ViewType, MPRViewState, Vec3 } from '@/core/types';
 import { eventBus } from '@/core/EventBus';
-import { ROICanvasOverlay, ViewTransform } from './ROICanvasOverlay';
 
 // VTK.js 类型声明（简化）
 declare const vtk: {
@@ -125,9 +124,6 @@ export class MPRView {
     // 体数据
     private volume: VolumeData | null = null;
 
-    // ROI 叠加层
-    private roiOverlay: ROICanvasOverlay | null = null;
-
     constructor(container: HTMLElement, viewType: ViewType) {
         this.container = container;
         this.viewType = viewType;
@@ -189,9 +185,6 @@ export class MPRView {
 
         // 设置相机
         this.setupCamera();
-
-        // 创建 ROI 叠加层（顶层）
-        this.roiOverlay = new ROICanvasOverlay(this.container, this.viewType);
 
         // 监听窗口大小变化
         window.addEventListener('resize', this.handleResize);
@@ -416,39 +409,10 @@ export class MPRView {
     }
 
     /**
-     * 获取 ROI 叠加层
-     */
-    getROIOverlay(): ROICanvasOverlay | null {
-        return this.roiOverlay;
-    }
-
-    /**
-     * 更新 ROI 叠加层的坐标变换
-     */
-    updateROITransform(): void {
-        if (!this.roiOverlay || !this.volume) return;
-
-        const rect = this.container.getBoundingClientRect();
-        const transform: ViewTransform = {
-            viewportWidth: rect.width,
-            viewportHeight: rect.height,
-            dimensions: this.volume.metadata.dimensions,
-            spacing: this.volume.metadata.spacing,
-            origin: this.volume.metadata.origin,
-            sliceIndex: this.state.sliceIndex,
-            zoom: this.state.zoom,
-            pan: this.state.pan,
-        };
-
-        this.roiOverlay.setTransform(transform);
-    }
-
-    /**
      * 销毁
      */
     dispose(): void {
         window.removeEventListener('resize', this.handleResize);
-        this.roiOverlay?.dispose();
         // VTK 对象清理...
     }
 }

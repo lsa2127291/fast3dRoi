@@ -18,16 +18,8 @@ import vtkInteractorStyleImage from '@kitware/vtk.js/Interaction/Style/Interacto
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 
-// ROI 系统导入
-import { roiManager } from './annotation/SparseROIManager';
-import { brushTool } from './annotation/BrushTool';
-import { eventBus } from './core/EventBus';
-import { extractContour } from './annotation/ContourExtractor';
-import type { Vec3 } from './core/types';
-
-// 3D 渲染系统导入
-import { VolumeView3D } from './views/VolumeView3D';
-import { meshGenerator } from './mesh/MarchingCubesMeshGenerator';
+// 从 vtkImageMapper 获取正确的 SlicingMode
+import { SlicingMode } from '@kitware/vtk.js/Rendering/Core/ImageMapper/Constants';
 
 // dcmjs 全局变量（通过 CDN 加载）
 declare const dcmjs: {
@@ -39,9 +31,6 @@ declare const dcmjs: {
         };
     };
 };
-
-// 从 vtkImageMapper 获取正确的 SlicingMode
-import { SlicingMode } from '@kitware/vtk.js/Rendering/Core/ImageMapper/Constants';
 
 type ViewType = 'axial' | 'sagittal' | 'coronal';
 
@@ -59,11 +48,6 @@ class VTKMPRView {
     private windowCenter = 40;
     private dimensions: number[] = [1, 1, 1];
     private imageSpacing: number[] = [1, 1, 1];
-
-    // ROI 叠加层
-    private roiCanvas: HTMLCanvasElement | null = null;
-    private roiCtx: CanvasRenderingContext2D | null = null;
-    private isDrawing = false;
 
     constructor(container: HTMLElement, viewType: ViewType) {
         this.container = container;
@@ -100,7 +84,7 @@ class VTKMPRView {
             // 注意：某些 VTK.js 对象可能是冻结的，导致赋值失败
 
             // 1. 左键: Pan (原默认是 WL)
-            (style as any).handleLeftButtonPress = (callData: any) => {
+            (style as any).handleLeftButtonPress = (_callData: any) => {
                 style.startPan();
             };
             (style as any).handleLeftButtonRelease = () => {
@@ -108,7 +92,7 @@ class VTKMPRView {
             };
 
             // 2. 右键: Window/Level (原默认是 Zoom)
-            (style as any).handleRightButtonPress = (callData: any) => {
+            (style as any).handleRightButtonPress = (_callData: any) => {
                 style.startWindowLevel();
             };
             (style as any).handleRightButtonRelease = () => {
@@ -116,7 +100,7 @@ class VTKMPRView {
             };
 
             // 3. 中键: Zoom (原默认是 Pan)
-            (style as any).handleMiddleButtonPress = (callData: any) => {
+            (style as any).handleMiddleButtonPress = (_callData: any) => {
                 style.startDolly();
             };
             (style as any).handleMiddleButtonRelease = () => {
@@ -159,13 +143,9 @@ class VTKMPRView {
         // 设置相机
         this.setupCamera();
 
-        // 创建 ROI 叠加层 Canvas
-        this.createROICanvasOverlay();
-
         // 监听窗口大小变化
         new ResizeObserver(() => {
             this.updateSize();
-            this.updateROICanvasSize();
             this.render();
         }).observe(this.container);
 
@@ -180,312 +160,8 @@ class VTKMPRView {
             this.imageMapper.setSlice(newSlice);
             this.render();
             this.updateLabel();
-            this.renderROIOverlay(); // 重新渲染 ROI
-        });
-
-        // ROI 绘制事件 (Ctrl + 左键)
-        this.setupDrawingEvents();
-    }
-
-    private createROICanvasOverlay(): void {
-        this.roiCanvas = document.createElement('canvas');
-        this.roiCanvas.className = 'roi-overlay';
-        this.roiCanvas.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            pointer-events: none;
-            z-index: 5;
-        `;
-        this.container.appendChild(this.roiCanvas);
-        this.roiCtx = this.roiCanvas.getContext('2d', { alpha: true });
-        this.updateROICanvasSize();
-    }
-
-    private updateROICanvasSize(): void {
-        if (!this.roiCanvas) return;
-        const { width, height } = this.container.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        this.roiCanvas.width = width * dpr;
-        this.roiCanvas.height = height * dpr;
-        this.roiCtx?.scale(dpr, dpr);
-    }
-
-    private setupDrawingEvents(): void {
-        // 使用 capture 阶段拦截事件，在 VTK 交互器之前处理
-        this.container.addEventListener('mousedown', (e) => {
-            // 当 Ctrl 按下时，阻止所有鼠标按键触发 VTK 交互（包括旋转）
-            if (e.ctrlKey) {
-                e.preventDefault();
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-
-                // 禁用 VTK 交互器
-                if (this.interactor) {
-                    this.interactor.disable();
-                }
-
-                // 只有左键才开始绘制
-                if (e.button === 0) {
-                    this.startDrawing(e);
-                }
-            }
-        }, { capture: true });
-
-        this.container.addEventListener('mousemove', (e) => {
-            if (this.isDrawing) {
-                e.preventDefault();
-                e.stopPropagation();
-                this.continueDrawing(e);
-            }
-        }, { capture: true });
-
-        this.container.addEventListener('mouseup', () => {
-            if (this.isDrawing) {
-                this.stopDrawing();
-            }
-        }, { capture: true });
-
-        this.container.addEventListener('mouseleave', () => {
-            if (this.isDrawing) {
-                this.stopDrawing();
-            }
         });
     }
-
-    private startDrawing(e: MouseEvent): void {
-        this.isDrawing = true;
-        brushTool.beginStroke();
-        this.paintAtPosition(e);
-    }
-
-    private continueDrawing(e: MouseEvent): void {
-        this.paintAtPosition(e);
-    }
-
-    private stopDrawing(): void {
-        this.isDrawing = false;
-        brushTool.endStroke();
-        eventBus.emit('roi:update', {});
-
-        // 重新启用 VTK 交互器前，先清除任何未完成的交互状态
-        if (this.interactor) {
-            const style = this.interactor.getInteractorStyle();
-            if (style) {
-                // 结束所有可能正在进行的交互状态
-                try {
-                    (style as any).endPan?.();
-                    (style as any).endRotate?.();
-                    (style as any).endDolly?.();
-                    (style as any).endSpin?.();
-                    (style as any).endWindowLevel?.();
-                } catch (e) {
-                    // 忽略错误
-                }
-            }
-            this.interactor.enable();
-        }
-    }
-
-    private paintAtPosition(e: MouseEvent): void {
-        const rect = this.container.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-
-        // 转换为体素坐标
-        const voxelCoord = this.screenToVoxel(x, y, rect.width, rect.height);
-        if (!voxelCoord) return;
-
-        const [screenVoxelX, screenVoxelY] = voxelCoord;
-        const sliceIndex = this.imageMapper?.getSlice() || 0;
-
-        // 根据视图类型构建 3D 坐标
-        let worldCoord: Vec3;
-        switch (this.viewType) {
-            case 'axial':
-                worldCoord = [screenVoxelX, screenVoxelY, sliceIndex];
-                break;
-            case 'sagittal':
-                worldCoord = [sliceIndex, screenVoxelX, screenVoxelY];
-                break;
-            case 'coronal':
-                worldCoord = [screenVoxelX, sliceIndex, screenVoxelY];
-                break;
-            default:
-                return;
-        }
-
-        // 转换到虚拟空间并绘制实心圆（连续笔刷）
-        const [wx, wy, wz] = roiManager.ctToVirtual(worldCoord[0], worldCoord[1], worldCoord[2]);
-        const config = brushTool.getConfig();
-
-        // 根据视图类型使用正确的平面和坐标
-        // paintCircle(center1, center2, fixedAxisValue, radius, roiId, erase, plane)
-        switch (this.viewType) {
-            case 'axial':
-                // Axial: XY 平面，Z 固定
-                roiManager.paintCircle(
-                    Math.round(wx), Math.round(wy), Math.round(wz),
-                    config.radius, config.roiId, config.eraseMode, 'xy'
-                );
-                break;
-            case 'sagittal':
-                // Sagittal: YZ 平面，X 固定
-                roiManager.paintCircle(
-                    Math.round(wy), Math.round(wz), Math.round(wx),
-                    config.radius, config.roiId, config.eraseMode, 'yz'
-                );
-                break;
-            case 'coronal':
-                // Coronal: XZ 平面，Y 固定
-                roiManager.paintCircle(
-                    Math.round(wx), Math.round(wz), Math.round(wy),
-                    config.radius, config.roiId, config.eraseMode, 'xz'
-                );
-                break;
-        }
-
-        // 实时渲染 ROI
-        this.renderROIOverlay();
-    }
-
-    private screenToVoxel(screenX: number, screenY: number, viewWidth: number, viewHeight: number): [number, number] | null {
-        // 归一化到 [0, 1]
-        const normalizedX = screenX / viewWidth;
-        const normalizedY = screenY / viewHeight;
-
-        // 获取当前视图对应的尺寸
-        let dimX: number, dimY: number;
-        switch (this.viewType) {
-            case 'axial':
-                dimX = this.dimensions[0];
-                dimY = this.dimensions[1];
-                break;
-            case 'sagittal':
-                dimX = this.dimensions[1];
-                dimY = this.dimensions[2];
-                break;
-            case 'coronal':
-                dimX = this.dimensions[0];
-                dimY = this.dimensions[2];
-                break;
-            default:
-                return null;
-        }
-
-        // 映射到体素坐标
-        const voxelX = Math.floor(normalizedX * dimX);
-        const voxelY = Math.floor(normalizedY * dimY);
-
-        return [voxelX, voxelY];
-    }
-
-    renderROIOverlay(): void {
-        if (!this.roiCtx || !this.roiCanvas) return;
-
-        const { width, height } = this.container.getBoundingClientRect();
-        this.roiCtx.clearRect(0, 0, width, height);
-
-        const sliceIndex = this.imageMapper?.getSlice() || 0;
-
-        // 获取当前视图对应的尺寸和 spacing
-        let dimX: number, dimY: number;
-        let spacingX: number, spacingY: number;
-        switch (this.viewType) {
-            case 'axial':
-                dimX = this.dimensions[0];
-                dimY = this.dimensions[1];
-                spacingX = this.imageSpacing[0];
-                spacingY = this.imageSpacing[1];
-                break;
-            case 'sagittal':
-                dimX = this.dimensions[1];
-                dimY = this.dimensions[2];
-                spacingX = this.imageSpacing[1];
-                spacingY = this.imageSpacing[2];
-                break;
-            case 'coronal':
-                dimX = this.dimensions[0];
-                dimY = this.dimensions[2];
-                spacingX = this.imageSpacing[0];
-                spacingY = this.imageSpacing[2];
-                break;
-            default:
-                return;
-        }
-
-        // 计算物理尺寸 (mm)
-        const physicalWidth = dimX * spacingX;
-        const physicalHeight = dimY * spacingY;
-
-        // 计算缩放因子：体素坐标 -> 物理坐标 -> Canvas 像素
-        // 需要保持宽高比，选择较小的缩放因子以适应视口
-        const scaleToFitX = width / physicalWidth;
-        const scaleToFitY = height / physicalHeight;
-        const uniformScale = Math.min(scaleToFitX, scaleToFitY);
-
-        // 最终缩放因子：体素坐标 * spacing * uniformScale = Canvas 像素
-        const scaleX = spacingX * uniformScale;
-        const scaleY = spacingY * uniformScale;
-
-        // 居中偏移
-        const offsetX = (width - physicalWidth * uniformScale) / 2;
-        const offsetY = (height - physicalHeight * uniformScale) / 2;
-
-        // 获取当前切片上所有 ROI 的 mask
-        const masks = roiManager.getSliceMasks(
-            sliceIndex,
-            this.viewType as 'axial' | 'sagittal' | 'coronal',
-            dimX,
-            dimY
-        );
-
-        // 设置线条样式
-        this.roiCtx.lineWidth = 2;
-        this.roiCtx.lineCap = 'round';
-        this.roiCtx.lineJoin = 'round';
-
-        // 遍历每个 ROI 绘制轮廓线
-        for (const [roiId, mask] of masks) {
-            const meta = roiManager.getROIMetadata(roiId);
-            if (!meta || !meta.visible) continue;
-
-            // 提取轮廓
-            const contour = extractContour(mask, dimX, dimY, roiId);
-            console.log(`[ROI Render] ROI ${roiId}: contour paths=${contour.paths.length}`);
-            if (contour.paths.length === 0) continue;
-
-            // 设置颜色（使用 ROI 元数据中的颜色）
-            const color = meta.color;
-            this.roiCtx.strokeStyle = `rgba(${color[0]}, ${color[1]}, ${color[2]}, 1)`;
-
-            // 绘制每条路径
-            for (const path of contour.paths) {
-                if (path.length < 2) continue;
-
-                this.roiCtx.beginPath();
-
-                // 转换并绘制第一个点（加上居中偏移）
-                const startX = path[0].x * scaleX + offsetX;
-                const startY = path[0].y * scaleY + offsetY;
-                this.roiCtx.moveTo(startX, startY);
-
-                // 绘制后续点
-                for (let i = 1; i < path.length; i++) {
-                    const x = path[i].x * scaleX + offsetX;
-                    const y = path[i].y * scaleY + offsetY;
-                    this.roiCtx.lineTo(x, y);
-                }
-
-                // 闭合路径并描边
-                this.roiCtx.closePath();
-                this.roiCtx.stroke();
-            }
-        }
-    }
-
 
     private getMaxSlice(): number {
         switch (this.viewType) {
@@ -621,6 +297,16 @@ class VTKMPRView {
 
     render(): void {
         this.renderWindow?.render();
+    }
+
+    /** 获取当前视图的维度信息（供外部模块使用） */
+    getDimensions(): number[] {
+        return [...this.dimensions];
+    }
+
+    /** 获取当前视图的 spacing 信息（供外部模块使用） */
+    getSpacing(): number[] {
+        return [...this.imageSpacing];
     }
 }
 
@@ -820,11 +506,6 @@ let currentImageData: any = null;
 let currentWindowWidth = 400;
 let currentWindowCenter = 40;
 
-// 3D 视图实例
-let volumeView3D: VolumeView3D | null = null;
-let update3DTimer: ReturnType<typeof setTimeout> | null = null;
-let currentROIId = 1; // 当前选中的 ROI ID
-
 async function initializeApp(): Promise<void> {
     console.log('Medical Imaging Viewer - Initializing VTK.js...');
 
@@ -842,19 +523,10 @@ async function initializeApp(): Promise<void> {
     // 设置窗宽窗位控件
     setupWindowLevelControls();
 
-    // 设置 ROI 绘制控件
+    // 设置 ROI 绘制控件（WebGPU 勾画系统待接入）
     setupROIControls();
 
-    // 初始化 3D 视图
-    const volumeContainer = document.getElementById('volume-view');
-    if (volumeContainer) {
-        volumeView3D = new VolumeView3D(volumeContainer);
-        volumeView3D.initialize();
-        console.log('[Main] VolumeView3D initialized');
-    }
-
-    // 设置 ROI 更新事件监听（实时更新 3D 视图）
-    setup3DViewUpdateListener();
+    // TODO: Phase 5 — 在此处初始化 WebGPU 渲染器并绑定到 #volume-view
 
     // 自动加载测试数据
     await loadTestDicomData();
@@ -863,101 +535,32 @@ async function initializeApp(): Promise<void> {
 }
 
 function setupROIControls(): void {
-    // ROI 选择
+    // ROI 选择 — WebGPU 勾画系统待接入
     const roiSelect = document.getElementById('roi-select') as HTMLSelectElement;
     if (roiSelect) {
         roiSelect.addEventListener('change', () => {
             const roiId = parseInt(roiSelect.value);
-            brushTool.setROI(roiId);
-            currentROIId = roiId;  // 同步更新当前 ROI ID
-            console.log(`ROI 切换为: ${roiId}`);
+            console.log(`ROI 切换为: ${roiId} (WebGPU annotation system not yet initialized)`);
         });
     }
 
-    // 笔刷大小
+    // 笔刷大小 — WebGPU 勾画系统待接入
     const brushSizeInput = document.getElementById('brush-size') as HTMLInputElement;
     const brushSizeLabel = document.getElementById('brush-size-label');
     if (brushSizeInput && brushSizeLabel) {
         brushSizeInput.addEventListener('input', () => {
             const size = parseInt(brushSizeInput.value);
-            brushTool.setRadius(size);
             brushSizeLabel.textContent = String(size);
-            console.log(`笔刷大小: ${size}`);
+            console.log(`笔刷大小: ${size} (WebGPU annotation system not yet initialized)`);
         });
     }
 
-    // 擦除模式
+    // 擦除模式 — WebGPU 勾画系统待接入
     const eraseModeInput = document.getElementById('erase-mode') as HTMLInputElement;
     if (eraseModeInput) {
         eraseModeInput.addEventListener('change', () => {
-            brushTool.setEraseMode(eraseModeInput.checked);
-            console.log(`擦除模式: ${eraseModeInput.checked ? '开启' : '关闭'}`);
+            console.log(`擦除模式: ${eraseModeInput.checked ? '开启' : '关闭'} (WebGPU annotation system not yet initialized)`);
         });
-    }
-
-    // 监听 ROI 更新事件，刷新所有视图
-    eventBus.on('roi:update', () => {
-        for (const view of views.values()) {
-            view.renderROIOverlay();
-        }
-    });
-}
-
-/**
- * 设置 3D 视图更新监听器
- * 使用防抖策略，笔刷绘制结束后 300ms 触发 3D 网格更新
- */
-function setup3DViewUpdateListener(): void {
-    // 监听 ROI 绘制事件
-    eventBus.on('roi:paint', (data: { roiId: number }) => {
-        // 防抖处理
-        if (update3DTimer) {
-            clearTimeout(update3DTimer);
-        }
-
-        update3DTimer = setTimeout(() => {
-            update3DMesh(data.roiId);
-        }, 300);
-    });
-
-    // 监听 ROI 更新事件（笔刷结束时触发）
-    eventBus.on('roi:update', () => {
-        // 防抖处理
-        if (update3DTimer) {
-            clearTimeout(update3DTimer);
-        }
-
-        update3DTimer = setTimeout(() => {
-            // 更新当前选中的 ROI
-            update3DMesh(currentROIId);
-        }, 200);
-    });
-
-    console.log('[Main] 3D View update listener registered');
-}
-
-/**
- * 更新指定 ROI 的 3D 网格
- */
-function update3DMesh(roiId: number): void {
-    if (!volumeView3D) return;
-
-    console.log(`[Main] Updating 3D mesh for ROI ${roiId}...`);
-
-    // 设置 spacing
-    const spacing = roiManager.getSpacing();
-    meshGenerator.setSpacing(spacing);
-
-    // 生成网格
-    const mesh = meshGenerator.generateMesh(roiId);
-
-    if (mesh) {
-        volumeView3D.updateROIMesh(roiId, mesh);
-        console.log(`[Main] 3D mesh updated: ${mesh.triangleCount} triangles`);
-    } else {
-        // 如果没有网格数据，移除 Actor
-        volumeView3D.removeROI(roiId);
-        console.log(`[Main] ROI ${roiId} removed from 3D view (no data)`);
     }
 }
 
@@ -1013,11 +616,6 @@ async function loadTestDicomData(): Promise<void> {
 
         // 更新信息
         const dims = currentImageData.getDimensions();
-        const spacing = currentImageData.getSpacing();
-
-        // 初始化 ROI 管理器
-        roiManager.initialize(null as unknown as WebGL2RenderingContext, dims as Vec3, spacing as Vec3);
-        console.log('ROI Manager initialized with dimensions:', dims);
 
         const statsInfo = document.getElementById('stats-info');
         if (statsInfo) {
@@ -1025,7 +623,7 @@ async function loadTestDicomData(): Promise<void> {
                 <div>尺寸: ${dims[0]} × ${dims[1]} × ${dims[2]}</div>
                 <div>类型: ${useTestData ? '测试数据' : 'CT DICOM'}</div>
                 <div>来源: ${useTestData ? '程序生成' : 'dcmtest/Anonymized0706'}</div>
-                <div style="color: var(--accent);">ROI: 按住 Ctrl + 左键绘制</div>
+                <div style="color: var(--accent);">WebGPU 勾画系统重构中...</div>
             `;
         }
 
