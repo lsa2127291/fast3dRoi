@@ -21,6 +21,13 @@ import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 // 从 vtkImageMapper 获取正确的 SlicingMode
 import { SlicingMode } from '@kitware/vtk.js/Rendering/Core/ImageMapper/Constants';
 
+// WebGPU 渲染系统
+import { initWebGPU, WebGPUInitError } from './gpu/WebGPUContext';
+import { WebGPURenderer } from './gpu/WebGPURenderer';
+import { packVertexQ } from './gpu/data/VertexQ';
+import type { VertexQEncoded } from './gpu/data/VertexQ';
+import { QUANT_STEP_MM } from './gpu/constants';
+
 // dcmjs 全局变量（通过 CDN 加载）
 declare const dcmjs: {
     data: {
@@ -500,6 +507,84 @@ async function loadDicomFromUrls(
     };
 }
 
+// ========== WebGPU 3D 视图 ==========
+
+/** 生成测试立方体（VertexQ 编码） */
+function createTestCube(): { vertices: VertexQEncoded[]; indices: number[] } {
+    // 立方体尺寸 100mm，中心在原点
+    const size = 100;
+    const positions = [
+        [-size, -size, -size], [size, -size, -size], [size, size, -size], [-size, size, -size], // 前面
+        [-size, -size, size], [size, -size, size], [size, size, size], [-size, size, size],   // 后面
+    ];
+
+    // 量化编码（原点 0, 步长 0.1mm）
+    const vertices: VertexQEncoded[] = positions.map(([x, y, z]) => {
+        const qx = Math.round(x / QUANT_STEP_MM);
+        const qy = Math.round(y / QUANT_STEP_MM);
+        const qz = Math.round(z / QUANT_STEP_MM);
+        return packVertexQ(qx, qy, qz, 0);
+    });
+
+    // 立方体索引（12 个三角形）
+    const indices = [
+        0, 1, 2, 0, 2, 3, // 前
+        4, 6, 5, 4, 7, 6, // 后
+        0, 3, 7, 0, 7, 4, // 左
+        1, 5, 6, 1, 6, 2, // 右
+        3, 2, 6, 3, 6, 7, // 上
+        0, 4, 5, 0, 5, 1, // 下
+    ];
+
+    return { vertices, indices };
+}
+
+let webgpuRenderer: WebGPURenderer | null = null;
+
+/** 初始化 WebGPU 3D 视图 */
+async function initializeWebGPUView(): Promise<void> {
+    const container = document.getElementById('volume-view');
+    if (!container) {
+        console.warn('[WebGPU] #volume-view 容器未找到');
+        return;
+    }
+
+    try {
+        // 初始化 WebGPU 上下文
+        const ctx = await initWebGPU();
+        console.log('[WebGPU] 初始化成功');
+
+        // 创建渲染器
+        webgpuRenderer = new WebGPURenderer(ctx);
+        await webgpuRenderer.initialize(container);
+
+        // 上传测试立方体
+        const { vertices, indices } = createTestCube();
+        webgpuRenderer.uploadMesh(vertices, indices);
+
+        // 启动渲染循环
+        webgpuRenderer.startRenderLoop();
+
+        console.log('[WebGPU] 测试立方体已加载');
+    } catch (err) {
+        if (err instanceof WebGPUInitError) {
+            console.error('[WebGPU] 初始化失败:', err.message);
+            // 在容器中显示友好错误提示
+            container.innerHTML = `
+                <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #ff6b6b; text-align: center; padding: 20px;">
+                    <div>
+                        <h3>WebGPU 不可用</h3>
+                        <p>${err.message}</p>
+                        <p style="font-size: 0.9em; margin-top: 10px;">请使用 Chrome 136+ 并确保 GPU 驱动已更新。</p>
+                    </div>
+                </div>
+            `;
+        } else {
+            console.error('[WebGPU] 未知错误:', err);
+        }
+    }
+}
+
 // ========== 主应用 ==========
 const views: Map<ViewType, VTKMPRView> = new Map();
 let currentImageData: any = null;
@@ -526,7 +611,8 @@ async function initializeApp(): Promise<void> {
     // 设置 ROI 绘制控件（WebGPU 勾画系统待接入）
     setupROIControls();
 
-    // TODO: Phase 5 — 在此处初始化 WebGPU 渲染器并绑定到 #volume-view
+    // 初始化 WebGPU 渲染器并绑定到 #volume-view
+    await initializeWebGPUView();
 
     // 自动加载测试数据
     await loadTestDicomData();
