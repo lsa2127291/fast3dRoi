@@ -23,3 +23,9 @@ export * from './constants';
 
 // 数据模型
 export * from './data';
+
+// 渲染管线
+export * from './pipelines';
+
+// 渲染器
+export { WebGPURenderer } from './WebGPURenderer';
