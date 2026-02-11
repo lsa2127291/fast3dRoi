@@ -874,7 +874,11 @@ let annotationRuntime: AnnotationRuntime | null = null;
 let annotationControllers: AnnotationInteractionController[] = [];
 const annotationPerformanceTracker = new AnnotationPerformanceTracker({
     maxSamplesPerMetric: 240,
+    timestampQueryEnabled: false,
 });
+let webgpuSessionId = 0;
+let webgpuRecoveryInFlight = false;
+let webgpuRecoveryQueued = false;
 
 function updateHistoryControlsState(): void {
     const undoBtn = document.getElementById('annotation-undo') as HTMLButtonElement | null;
@@ -923,34 +927,59 @@ function updatePerformanceStatus(): void {
     const statsInfo = document.getElementById('stats-info');
     if (!statsInfo) return;
 
-    let line = document.getElementById('annotation-performance-line');
-    if (!line) {
-        line = document.createElement('div');
-        line.id = 'annotation-performance-line';
-        line.style.marginTop = '4px';
-        line.style.color = 'var(--text-secondary)';
-        statsInfo.appendChild(line);
+    let summaryLine = document.getElementById('annotation-performance-line');
+    if (!summaryLine) {
+        summaryLine = document.createElement('div');
+        summaryLine.id = 'annotation-performance-line';
+        summaryLine.style.marginTop = '4px';
+        summaryLine.style.color = 'var(--text-secondary)';
+        statsInfo.appendChild(summaryLine);
+    }
+
+    let timestampLine = document.getElementById('annotation-timestamp-line');
+    if (!timestampLine) {
+        timestampLine = document.createElement('div');
+        timestampLine.id = 'annotation-timestamp-line';
+        timestampLine.style.marginTop = '4px';
+        timestampLine.style.color = 'var(--text-secondary)';
+        statsInfo.appendChild(timestampLine);
     }
 
     const report = annotationPerformanceTracker.getReport();
     const preview = report.metrics['mousemove-preview'];
     const pageFlip = report.metrics['page-flip'];
     const sync = report.metrics['mouseup-sync'];
+    const diag = report.diagnostics;
 
     const formatMetric = (
         label: string,
+        p50: number | null,
         p95: number | null,
+        p99: number | null,
         targetMs: number,
         withinTarget: boolean
     ): string => {
         if (p95 === null) {
-            return `${label} --/${targetMs}ms`;
+            return `${label} --/--/-- | target ${targetMs}ms`;
         }
         const state = withinTarget ? 'OK' : 'SLOW';
-        return `${label} ${p95.toFixed(1)}/${targetMs}ms ${state}`;
+        const p50Text = p50 === null ? '--' : p50.toFixed(1);
+        const p99Text = p99 === null ? '--' : p99.toFixed(1);
+        return `${label} ${p50Text}/${p95.toFixed(1)}/${p99Text}ms | target ${targetMs}ms ${state}`;
     };
 
-    line.textContent = `P95: ${formatMetric('move', preview.p95, preview.targetMs, preview.withinTarget)} | ${formatMetric('flip', pageFlip.p95, pageFlip.targetMs, pageFlip.withinTarget)} | ${formatMetric('sync', sync.p95, sync.targetMs, sync.withinTarget)}`;
+    summaryLine.textContent =
+        `P50/P95/P99: ${formatMetric('move', preview.p50, preview.p95, preview.p99, preview.targetMs, preview.withinTarget)} | `
+        + `${formatMetric('flip', pageFlip.p50, pageFlip.p95, pageFlip.p99, pageFlip.targetMs, pageFlip.withinTarget)} | `
+        + `${formatMetric('sync', sync.p50, sync.p95, sync.p99, sync.targetMs, sync.withinTarget)}`;
+
+    timestampLine.textContent =
+        `timestamp-query: ${report.timestampQueryEnabled ? 'ON' : 'OFF'}`
+        + ` | overflow ${diag.overflowCount}`
+        + ` | quantOverflow ${diag.quantOverflowCount}`
+        + ` | deferred ${diag.deferredLines}`
+        + ` | budgetHit ${diag.budgetHitCount}`
+        + ` | batches ${diag.batchCount}`;
 }
 
 function recordPerformanceSample(sample: AnnotationPerformanceSample): void {
@@ -998,6 +1027,8 @@ function emitViewSyncToEventBus(event: ViewSyncEvent): void {
         budgetHit: event.budgetHit,
         totalLineCount: event.totalLineCount,
         totalDeferredLines: event.totalDeferredLines,
+        overflow: event.overflow,
+        quantOverflow: event.quantOverflow,
         centerMM: event.centerMM,
         brushRadiusMM: event.brushRadiusMM,
         erase: event.erase,
@@ -1007,18 +1038,24 @@ function emitViewSyncToEventBus(event: ViewSyncEvent): void {
                 sliceIndex: event.viewResults.axial.sliceIndex,
                 lineCount: event.viewResults.axial.lineCount,
                 deferredLines: event.viewResults.axial.deferredLines,
+                overflow: event.viewResults.axial.overflow,
+                quantOverflow: event.viewResults.axial.quantOverflow,
             },
             {
                 viewType: 'sagittal',
                 sliceIndex: event.viewResults.sagittal.sliceIndex,
                 lineCount: event.viewResults.sagittal.lineCount,
                 deferredLines: event.viewResults.sagittal.deferredLines,
+                overflow: event.viewResults.sagittal.overflow,
+                quantOverflow: event.viewResults.sagittal.quantOverflow,
             },
             {
                 viewType: 'coronal',
                 sliceIndex: event.viewResults.coronal.sliceIndex,
                 lineCount: event.viewResults.coronal.lineCount,
                 deferredLines: event.viewResults.coronal.deferredLines,
+                overflow: event.viewResults.coronal.overflow,
+                quantOverflow: event.viewResults.coronal.quantOverflow,
             },
         ],
     });
@@ -1050,6 +1087,29 @@ function syncAnnotationControlsToEngine(): void {
     }
 }
 
+async function recoverWebGPUAfterDeviceLost(reason: string): Promise<void> {
+    if (webgpuRecoveryInFlight) {
+        webgpuRecoveryQueued = true;
+        return;
+    }
+    webgpuRecoveryInFlight = true;
+    updateSliceSyncStatus(`WebGPU 设备丢失，正在自动重建: ${reason}`);
+    try {
+        await initializeWebGPUView();
+        updateSliceSyncStatus('WebGPU 自动重建完成');
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[WebGPU] 自动重建失败:', error);
+        updateSliceSyncStatus(`WebGPU 自动重建失败: ${message}`);
+    } finally {
+        webgpuRecoveryInFlight = false;
+        if (webgpuRecoveryQueued) {
+            webgpuRecoveryQueued = false;
+            void recoverWebGPUAfterDeviceLost('queued');
+        }
+    }
+}
+
 /** 初始化 WebGPU 3D 视图 */
 async function initializeWebGPUView(): Promise<void> {
     const container = document.getElementById('volume-view');
@@ -1057,6 +1117,7 @@ async function initializeWebGPUView(): Promise<void> {
         console.warn('[WebGPU] #volume-view 容器未找到');
         return;
     }
+    const sessionId = ++webgpuSessionId;
 
     try {
         // 初始化 WebGPU 上下文
@@ -1073,7 +1134,16 @@ async function initializeWebGPUView(): Promise<void> {
         webgpuRenderer?.destroy();
         webgpuRenderer = null;
 
-        const ctx = await initWebGPU();
+        const ctx = await initWebGPU({
+            onDeviceLost: (info) => {
+                if (sessionId !== webgpuSessionId) {
+                    return;
+                }
+                const reason = `${info.reason}: ${info.message}`;
+                void recoverWebGPUAfterDeviceLost(reason);
+            },
+        });
+        annotationPerformanceTracker.setTimestampQueryEnabled(ctx.caps.timestamp);
         console.log('[WebGPU] 初始化成功');
 
         // 创建渲染器
@@ -1131,6 +1201,7 @@ async function initializeWebGPUView(): Promise<void> {
 
         console.log('[WebGPU] 测试立方体已加载');
     } catch (err) {
+        annotationPerformanceTracker.setTimestampQueryEnabled(false);
         if (err instanceof WebGPUInitError) {
             console.error('[WebGPU] 初始化失败:', err.message);
             // 在容器中显示友好错误提示
@@ -1181,6 +1252,14 @@ function setupEventBusIntegration(): void {
             view?.setSlice(target.sliceIndex, false); 
             view?.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, target.sliceIndex); 
         } 
+
+        annotationPerformanceTracker.recordDiagnostics({
+            overflowCount: payload.overflow,
+            quantOverflowCount: payload.quantOverflow,
+            deferredLines: payload.totalDeferredLines,
+            budgetHit: payload.budgetHit,
+        });
+        updatePerformanceStatus();
 
         const status = payload.budgetHit
             ? `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines} (budget hit)`

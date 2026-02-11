@@ -2,7 +2,7 @@
  * 基础渲染管线 — 解码 VertexQ 并渲染彩色三角形
  *
  * 绑定布局:
- *   group(0): storage buffers — vertex_pool, index_pool, quant_meta
+ *   group(0): storage buffers — vertex_pool, index_pool, quant_meta, normal_pool
  *   group(1): uniform buffer — MVP, model, color, light_dir
  */
 
@@ -74,6 +74,11 @@ export class BasicRenderPipeline {
                     visibility: GPUShaderStage.VERTEX,
                     buffer: { type: 'read-only-storage' },
                 },
+                { // normal_pool
+                    binding: 3,
+                    visibility: GPUShaderStage.VERTEX,
+                    buffer: { type: 'read-only-storage' },
+                },
             ],
         });
 
@@ -136,9 +141,11 @@ export class BasicRenderPipeline {
         vertexBuffer: GPUBuffer,
         indexBuffer: GPUBuffer,
         quantMetaBuffer: GPUBuffer,
+        normalBuffer: GPUBuffer,
         vertexSize?: number,
         indexSize?: number,
         quantMetaSize?: number,
+        normalSize?: number,
     ): GPUBindGroup {
         if (!this.bindGroupLayout0) throw new Error('Pipeline not initialized');
 
@@ -149,6 +156,7 @@ export class BasicRenderPipeline {
                 { binding: 0, resource: { buffer: vertexBuffer, size: vertexSize } },
                 { binding: 1, resource: { buffer: indexBuffer, size: indexSize } },
                 { binding: 2, resource: { buffer: quantMetaBuffer, size: quantMetaSize } },
+                { binding: 3, resource: { buffer: normalBuffer, size: normalSize } },
             ],
         });
     }

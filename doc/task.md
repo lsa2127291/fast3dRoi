@@ -61,10 +61,10 @@
 
 ## 技术债务
 
-- [ ] 法线计算（当前占位 `(0,0,1)`）
-- [ ] VertexQ 编解码单元测试
-- [ ] device.lost 自动重建
-- [ ] timestamp-query 性能面板
+- [x] 法线计算（当前占位 `(0,0,1)`）
+- [x] VertexQ 编解码单元测试
+- [x] device.lost 自动重建
+- [x] timestamp-query 性能面板
 
 ---
 
@@ -76,3 +76,5 @@
 - **里程碑 1 归档**: `doc/archive/webgpu-phase0-5-completion.md`
 - **里程碑 4 归档**: `doc/archive/webgpu-phase11-13-completion.md`
 - **里程碑 4 补充归档（交互/union 跟进）**: `doc/archive/webgpu-phase11-13-followup-2026-02-11.md`
+- **技术债验收归档（浏览器）**: `doc/archive/webgpu-phase11-13-followup-2026-02-11.md`
+

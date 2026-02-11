@@ -328,12 +328,17 @@ export class AnnotationEngine {
             });
 
             const endedAt = this.now();
+            const overflowCount = batches.reduce((sum, batch) => sum + batch.mesh.overflow, 0);
+            const quantOverflowCount = batches.reduce((sum, batch) => sum + batch.mesh.quantOverflow, 0);
             this.emitPerformanceSample({
                 metric: 'mouseup-sync',
                 durationMs: endedAt - stroke.timestamp,
                 timestamp: endedAt,
                 roiId: stroke.roiId,
                 viewType: stroke.viewType,
+                overflowCount,
+                quantOverflowCount,
+                batchCount: batches.length,
             });
 
             return result;

@@ -10,6 +10,7 @@ import { BasicRenderPipeline } from './pipelines/BasicRenderPipeline';
 import type { RenderUniforms } from './pipelines/BasicRenderPipeline';
 import type { VertexQEncoded, QuantMeta } from './data/VertexQ';
 import { writeVertexQToBuffer, writeQuantMetaToBuffer, createDefaultQuantMeta } from './data/VertexQ';
+import { computeVertexNormals } from './data/VertexNormals';
 import { VERTEX_Q_BYTES } from './constants';
 
 // ========== 数学工具 ==========
@@ -95,6 +96,7 @@ export class WebGPURenderer {
     private vertexBuffer: GPUBuffer | null = null;
     private indexBuffer: GPUBuffer | null = null;
     private quantMetaBuffer: GPUBuffer | null = null;
+    private normalBuffer: GPUBuffer | null = null;
     private indexCount = 0;
 
     // Camera state
@@ -210,6 +212,7 @@ export class WebGPURenderer {
         this.vertexBuffer?.destroy();
         this.indexBuffer?.destroy();
         this.quantMetaBuffer?.destroy();
+        this.normalBuffer?.destroy();
 
         const meta = quantMeta ?? createDefaultQuantMeta();
 
@@ -248,6 +251,18 @@ export class WebGPURenderer {
         writeQuantMetaToBuffer([meta], metaData, 0);
         device.queue.writeBuffer(this.quantMetaBuffer, 0, metaData);
 
+        const normalData = computeVertexNormals(vertices, indices, meta);
+        this.normalBuffer = device.createBuffer({
+            label: 'mesh_normals',
+            size: Math.max(16, normalData.byteLength),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        if (normalData.byteLength > 0) {
+            device.queue.writeBuffer(this.normalBuffer, 0, normalData);
+        } else {
+            device.queue.writeBuffer(this.normalBuffer, 0, new Float32Array([0, 0, 1, 0]));
+        }
+
         this.indexCount = indices.length;
 
         // 创建 storage bind group
@@ -256,6 +271,7 @@ export class WebGPURenderer {
                 this.vertexBuffer,
                 this.indexBuffer,
                 this.quantMetaBuffer,
+                this.normalBuffer,
             );
         }
 
@@ -380,6 +396,7 @@ export class WebGPURenderer {
         this.vertexBuffer?.destroy();
         this.indexBuffer?.destroy();
         this.quantMetaBuffer?.destroy();
+        this.normalBuffer?.destroy();
         this.depthTexture?.destroy();
         if (this.canvas && this.container) {
             this.container.removeChild(this.canvas);
@@ -391,6 +408,7 @@ export class WebGPURenderer {
         this.vertexBuffer = null;
         this.indexBuffer = null;
         this.quantMetaBuffer = null;
+        this.normalBuffer = null;
         this.pipeline = null;
         this.storageBindGroup = null;
         this.uniformBindGroup = null;

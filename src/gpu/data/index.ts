@@ -20,6 +20,10 @@ export type {
 } from './VertexQ';
 
 export {
+    computeVertexNormals,
+} from './VertexNormals';
+
+export {
     VertexPool,
     IndexPool,
 } from './ResourcePools';

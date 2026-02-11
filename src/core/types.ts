@@ -143,6 +143,8 @@ export interface EventMap {
         budgetHit: boolean;
         totalLineCount: number;
         totalDeferredLines: number;
+        overflow: number;
+        quantOverflow: number;
         centerMM: Vec3;
         brushRadiusMM: number;
         erase: boolean;
@@ -151,6 +153,8 @@ export interface EventMap {
             sliceIndex: number;
             lineCount: number;
             deferredLines: number;
+            overflow: number;
+            quantOverflow: number;
         }>;
     };
     'window:change': { windowWidth: number; windowCenter: number };

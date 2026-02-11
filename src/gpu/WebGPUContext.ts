@@ -36,6 +36,10 @@ export interface WebGPUContext {
     readonly preferredFormat: GPUTextureFormat;
 }
 
+export interface WebGPUInitOptions {
+    onDeviceLost?: (info: GPUDeviceLostInfo) => void;
+}
+
 // ========== 错误类型 ==========
 
 export type WebGPUInitErrorType = 'no-webgpu' | 'no-adapter' | 'missing-feature' | 'device-failed';
@@ -87,7 +91,7 @@ const REQUIRED_LIMITS: Record<string, number> = {
  *
  * @throws WebGPUInitError 如果缺少任何必需能力
  */
-export async function initWebGPU(): Promise<WebGPUContext> {
+export async function initWebGPU(options: WebGPUInitOptions = {}): Promise<WebGPUContext> {
     // 1. 检查 WebGPU API 是否存在
     if (!navigator.gpu) {
         throw new WebGPUInitError(
@@ -165,6 +169,7 @@ export async function initWebGPU(): Promise<WebGPUContext> {
     device.lost.then((info) => {
         console.error(`[WebGPU] 设备丢失: ${info.message} (reason: ${info.reason})`);
         _ctx = null;
+        options.onDeviceLost?.(info);
         // 后续可在此触发自动重建
     });
 

@@ -165,6 +165,11 @@ export interface AnnotationPerformanceSample {
     timestamp: number;
     roiId?: number;
     viewType?: MPRViewType;
+    overflowCount?: number;
+    quantOverflowCount?: number;
+    deferredLines?: number;
+    batchCount?: number;
+    budgetHit?: boolean;
 }
 
 export type DirtyBrickEstimator = (stroke: BrushStroke) => DirtyBrickKey[];

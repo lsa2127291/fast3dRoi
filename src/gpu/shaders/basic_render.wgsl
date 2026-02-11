@@ -24,6 +24,7 @@ struct Uniforms {
 @group(0) @binding(0) var<storage, read> vertex_pool: array<VertexQ>;
 @group(0) @binding(1) var<storage, read> index_pool: array<u32>;
 @group(0) @binding(2) var<storage, read> quant_meta: array<QuantMeta>;
+@group(0) @binding(3) var<storage, read> normal_pool: array<vec4<f32>>;
 @group(1) @binding(0) var<uniform> uniforms: Uniforms;
 
 // --- 工具函数 ---
@@ -55,13 +56,11 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let qmeta = quant_meta[0u];
 
     let pos_mm = decode_vertex(v, qmeta);
+    let normal = normal_pool[idx].xyz;
 
     var out: VertexOutput;
     out.position = uniforms.mvp * vec4<f32>(pos_mm, 1.0);
-
-    // 使用相邻顶点估算法线（简化：使用面法线，在 CPU 侧预计算更好）
-    // 这里暂时使用 (0,0,1) 占位，后续由 CPU 侧计算法线并传入
-    out.world_normal = normalize((uniforms.model * vec4<f32>(0.0, 0.0, 1.0, 0.0)).xyz);
+    out.world_normal = normalize((uniforms.model * vec4<f32>(normal, 0.0)).xyz);
 
     return out;
 }

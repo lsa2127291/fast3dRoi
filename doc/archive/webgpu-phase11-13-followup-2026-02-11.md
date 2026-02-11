@@ -116,5 +116,27 @@
    - 主归档已同步更新为最终验收状态（见 `doc/archive/webgpu-phase11-13-completion.md`）。
 ---
 
+## 技术债务补充验收（浏览器）
+
+**验收日期**: 2026-02-11  
+**验收环境**: Windows 11, Chrome 144, localhost:3000（DICOM 自动加载）  
+
+### 结果
+
+1. WebGPU 初始化成功，测试立方体可见（控制台含 `[WebGPU] 初始化成功`、`[WebGPURenderer] 初始化完成`）。  
+2. 医学数据加载成功，三视图切片索引正常更新（Axial/Sagittal/Coronal）。  
+3. 信息面板显示技术债性能项：  
+   - `P50/P95/P99` 行存在  
+   - `timestamp-query: ON | overflow 0 | quantOverflow 0 | deferred 0 | budgetHit 0 | batches 0`  
+
+### 已知非阻塞项
+
+- dcmjs 输出大量 `Invalid vr type ox - using OW`，属于测试数据兼容性日志，当前不阻塞渲染和交互。  
+- `favicon.ico` 缺失与 `vtkInteractorStyleImage` 键位重绑 warning 为既有噪声，不影响本轮技术债验收结论。  
+
+### 验收结论
+
+技术债条目（法线计算、VertexQ 编解码测试、device.lost 自动重建、timestamp-query 面板）在浏览器端验证通过，可归档。
 **归档日期**: 2026-02-11  
 **归档人**: Codex
+
