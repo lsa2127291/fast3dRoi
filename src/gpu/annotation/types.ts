@@ -133,6 +133,40 @@ export interface AnnotationCommitResult {
     viewSync?: ViewSyncEvent;
 }
 
+export interface AnnotationHistoryKeyframe {
+    index: number;
+    roiId: number;
+    activeROI: number;
+    brushRadiusMM: number;
+    eraseMode: boolean;
+    dirtyBrickKeys: DirtyBrickKey[];
+    quantOriginVersion: number;
+}
+
+export interface AnnotationHistoryEntry {
+    id: number;
+    stroke: BrushStroke;
+    dirtyBrickKeys: DirtyBrickKey[];
+    createdAt: number;
+    keyframe?: AnnotationHistoryKeyframe;
+}
+
+export interface AnnotationHistorySnapshot {
+    undoDepth: number;
+    redoDepth: number;
+    latestKeyframe?: AnnotationHistoryKeyframe;
+}
+
+export type AnnotationPerformanceMetric = 'mousemove-preview' | 'page-flip' | 'mouseup-sync';
+
+export interface AnnotationPerformanceSample {
+    metric: AnnotationPerformanceMetric;
+    durationMs: number;
+    timestamp: number;
+    roiId?: number;
+    viewType?: MPRViewType;
+}
+
 export type DirtyBrickEstimator = (stroke: BrushStroke) => DirtyBrickKey[];
 
 export interface SDFPipelineLike {

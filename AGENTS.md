@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGNENTS.md
 
 本文件为本仓库中工作时提供指导。
 
@@ -81,14 +81,23 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - 基础渲染管线（WGSL shader + 测试立方体）
 - 详见：`doc/archive/webgpu-phase0-5-completion.md`
 
-**里程碑 2** 🚧 待开展（Phase 6-8）：GPU 勾画核心
+**里程碑 2** ✅ 已完成（Phase 6-8）：GPU 勾画核心
 - SDF Bricks 存储
 - GPU Marching Cubes
 - 交互编辑管线
+- 详见：`doc/archive/webgpu-phase6-8-completion.md`
 
-**里程碑 3** 📋 待开展（Phase 9-10）：MPR 切面 + 同步
+**里程碑 3** ✅ 已完成（Phase 9-10）：MPR 切面 + 同步
+- MPR 切面管线
+- 三视图同步与事件总线联动
+- 详见：`doc/archive/webgpu-phase9-10-completion.md`
 
-**里程碑 4** 📋 待开展（Phase 11-13）：完善与优化
+**里程碑 4** ✅ 已完成（Phase 11-13）：完善与优化
+- Phase 11 撤销/重做已完成（操作历史 + 关键帧）
+- Phase 12 性能目标已实机达标（P95: move 1.0ms / flip 0.6ms / sync 21.0ms）
+- Phase 13 集成测试与端到端实机验证已完成（Chrome 144 + RTX 4000 Ada）
+- 详见：`doc/archive/webgpu-phase11-13-completion.md`
+- 补充：`doc/archive/webgpu-phase11-13-followup-2026-02-11.md`（右键交互/union 跟进）
 
 完整任务清单见 `doc/task.md`。
 
@@ -102,6 +111,11 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - **`doc/archive/vtk-phase6-implementation_plan.md`**：旧 VTK.js 阶段 6 性能优化计划
 - **`doc/archive/vtk-phase5-walkthrough.md`**：旧 VTK.js 阶段 5 完成说明
 - **`doc/archive/webgpu-phase0-5-completion.md`**：WebGPU 里程碑 1 完成归档
+- **`doc/archive/webgpu-phase6-8-completion.md`**：WebGPU 里程碑 2 完成归档
+- **`doc/archive/webgpu-phase9-10-completion.md`**：WebGPU 里程碑 3 完成归档
+- **`doc/archive/webgpu-phase11-13-completion.md`**：WebGPU 里程碑 4 完成归档
+- **`doc/archive/webgpu-phase11-13-followup-2026-02-11.md`**：WebGPU 里程碑 4 补充归档（交互与 union 跟进）
+
 
 ## 备注
 

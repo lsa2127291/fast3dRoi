@@ -14,6 +14,18 @@ export interface OverlayProjectionResult {
     ry: number;
 }
 
+export interface CircularOverlayPixelRadiiInput {
+    radiusNorm: number;
+    viewportWidth: number;
+    viewportHeight: number;
+    minRadiusPx?: number;
+}
+
+export interface CircularOverlayPixelRadiiResult {
+    rxPx: number;
+    ryPx: number;
+}
+
 function clamp01(value: number): number {
     return Math.min(1, Math.max(0, value));
 }
@@ -52,5 +64,18 @@ export function projectOverlayCircle(input: OverlayProjectionInput): OverlayProj
         cy,
         rx: radiusNorm,
         ry: radiusNorm,
+    };
+}
+
+export function computeCircularOverlayPixelRadii(
+    input: CircularOverlayPixelRadiiInput
+): CircularOverlayPixelRadiiResult {
+    const width = Math.max(1, input.viewportWidth);
+    const height = Math.max(1, input.viewportHeight);
+    const minRadiusPx = Math.max(0, input.minRadiusPx ?? 2);
+    const baseRadius = Math.max(minRadiusPx, Math.max(0, input.radiusNorm) * Math.min(width, height));
+    return {
+        rxPx: baseRadius,
+        ryPx: baseRadius,
     };
 }

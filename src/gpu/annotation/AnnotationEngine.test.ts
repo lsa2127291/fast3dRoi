@@ -158,4 +158,240 @@ describe('AnnotationEngine two-stage workflow', () => {
         expect(onViewSync).toHaveBeenCalledTimes(1);
         expect(onViewSync.mock.calls[0][0].viewResults.axial.sliceIndex).toBe(12);
     });
+
+    it('should apply union and erase against accumulated ROI geometry', async () => {
+        const onViewSync = vi.fn();
+        const engine = new AnnotationEngine({
+            onViewSync,
+            estimateDirtyBricks: (stroke) => (
+                stroke.centerMM[0] < 0 ? ['A_0_0'] : ['B_0_0']
+            ),
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async () => undefined,
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+            slicePipeline: {
+                extractSlices: async ({ roiId, dirtyBrickKeys, targets }) => {
+                    const lineCountPerView = dirtyBrickKeys.length;
+                    return {
+                        roiId,
+                        budget: 128,
+                        budgetHit: false,
+                        totalLineCount: lineCountPerView * 3,
+                        totalDeferredLines: 0,
+                        overflow: 0,
+                        quantOverflow: 0,
+                        viewResults: {
+                            axial: {
+                                viewType: 'axial',
+                                sliceIndex: targets.find((target) => target.viewType === 'axial')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                            sagittal: {
+                                viewType: 'sagittal',
+                                sliceIndex: targets.find((target) => target.viewType === 'sagittal')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                            coronal: {
+                                viewType: 'coronal',
+                                sliceIndex: targets.find((target) => target.viewType === 'coronal')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                        },
+                    };
+                },
+            },
+        });
+
+        await engine.commitStroke([-10, 0, 0], 'axial');
+        await engine.commitStroke([10, 0, 0], 'axial');
+        engine.setEraseMode(true);
+        await engine.commitStroke([10, 0, 0], 'axial');
+
+        expect(onViewSync).toHaveBeenCalledTimes(3);
+        expect(onViewSync.mock.calls[0][0].totalLineCount).toBe(3);
+        expect(onViewSync.mock.calls[1][0].totalLineCount).toBe(6);
+        expect(onViewSync.mock.calls[2][0].totalLineCount).toBe(3);
+    });
+
+    it('should support undo and redo with operation history', async () => {
+        const applyEraseFlags: boolean[] = [];
+        const engine = new AnnotationEngine({
+            estimateDirtyBricks: () => ['0_0_0'],
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async (stroke) => {
+                    applyEraseFlags.push(stroke.erase);
+                },
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+        });
+
+        engine.setEraseMode(false);
+        await engine.commitStroke([1, 2, 3], 'axial');
+        expect(engine.canUndo()).toBe(true);
+        expect(engine.canRedo()).toBe(false);
+
+        await engine.undoLast();
+        expect(applyEraseFlags).toEqual([false, true]);
+        expect(engine.canUndo()).toBe(false);
+        expect(engine.canRedo()).toBe(true);
+
+        await engine.redoLast();
+        expect(applyEraseFlags).toEqual([false, true, false]);
+        expect(engine.canUndo()).toBe(true);
+        expect(engine.canRedo()).toBe(false);
+
+        const snapshot = engine.getHistorySnapshot();
+        expect(snapshot.undoDepth).toBe(1);
+        expect(snapshot.redoDepth).toBe(0);
+    });
+
+    it('should cap undo and redo depth to 6 by default', async () => {
+        const engine = new AnnotationEngine({
+            estimateDirtyBricks: () => ['0_0_0'],
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async () => undefined,
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+        });
+
+        for (let i = 0; i < 8; i++) {
+            await engine.commitStroke([i, 0, 0], 'axial');
+        }
+
+        expect(engine.getHistorySnapshot().undoDepth).toBe(6);
+
+        for (let i = 0; i < 6; i++) {
+            const result = await engine.undoLast();
+            expect(result).not.toBeNull();
+        }
+        expect(await engine.undoLast()).toBeNull();
+        expect(engine.getHistorySnapshot().redoDepth).toBe(6);
+
+        for (let i = 0; i < 6; i++) {
+            const result = await engine.redoLast();
+            expect(result).not.toBeNull();
+        }
+        expect(await engine.redoLast()).toBeNull();
+    });
+
+    it('should create keyframes at configured history interval', async () => {
+        const engine = new AnnotationEngine({
+            historyKeyframeInterval: 2,
+            estimateDirtyBricks: () => ['0_0_0'],
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async () => undefined,
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+        });
+
+        await engine.commitStroke([0, 0, 0], 'axial');
+        await engine.commitStroke([1, 0, 0], 'axial');
+        await engine.commitStroke([2, 0, 0], 'axial');
+
+        const snapshot = engine.getHistorySnapshot();
+        expect(snapshot.undoDepth).toBe(3);
+        expect(snapshot.latestKeyframe?.index).toBe(2);
+        expect(snapshot.latestKeyframe?.roiId).toBe(1);
+    });
+
+    it('should report preview and sync performance samples', async () => {
+        const onPerformanceSample = vi.fn();
+        const engine = new AnnotationEngine({
+            onPerformanceSample,
+            now: vi
+                .fn()
+                .mockReturnValueOnce(1000)
+                .mockReturnValueOnce(1015)
+                .mockReturnValueOnce(2000)
+                .mockReturnValueOnce(2140),
+            estimateDirtyBricks: () => ['0_0_0'],
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async () => undefined,
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+            slicePipeline: {
+                extractSlices: async () => ({
+                    roiId: 1,
+                    budget: 128,
+                    budgetHit: false,
+                    totalLineCount: 3,
+                    totalDeferredLines: 0,
+                    overflow: 0,
+                    quantOverflow: 0,
+                    viewResults: {
+                        axial: { viewType: 'axial', sliceIndex: 1, lineCount: 1, deferredLines: 0, overflow: 0, quantOverflow: 0 },
+                        sagittal: { viewType: 'sagittal', sliceIndex: 1, lineCount: 1, deferredLines: 0, overflow: 0, quantOverflow: 0 },
+                        coronal: { viewType: 'coronal', sliceIndex: 1, lineCount: 1, deferredLines: 0, overflow: 0, quantOverflow: 0 },
+                    },
+                }),
+            },
+        });
+
+        await engine.previewStroke([0, 0, 0], 'axial');
+        await engine.commitStroke([0, 0, 0], 'axial');
+
+        expect(onPerformanceSample).toHaveBeenCalledWith(expect.objectContaining({
+            metric: 'mousemove-preview',
+            durationMs: 15,
+        }));
+        expect(onPerformanceSample).toHaveBeenCalledWith(expect.objectContaining({
+            metric: 'mouseup-sync',
+            durationMs: 140,
+        }));
+    });
 });

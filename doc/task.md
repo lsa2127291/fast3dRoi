@@ -45,14 +45,17 @@
 
 ---
 
-## 里程碑 4: 完善与优化（待开展）
+## 里程碑 4: 完善与优化 ✅ 已完成
 
-- [ ] **Phase 11**: 撤销/重做（§7）
-- [ ] **Phase 12**: 性能目标验证（§8）
-    - [ ] mousemove 预览 ≤ 30ms
-    - [ ] 翻页切面 ≤ 60ms
-    - [ ] mouseup 后三视图同步 ≤ 300ms
-- [ ] **Phase 13**: 集成测试 + 端到端验证
+- [x] **Phase 11**: 撤销/重做（§7）
+- [x] **Phase 12**: 性能目标验证（§8）
+    - [x] P95 采样与阈值对比链路（move/flip/sync）接入
+    - [x] mousemove 预览 ≤ 30ms（实机 P95: 1.0ms，2026-02-11）
+    - [x] 翻页切面 ≤ 60ms（实机 P95: 0.6ms，2026-02-11）
+    - [x] mouseup 后三视图同步 ≤ 300ms（实机 P95: 21.0ms，2026-02-11）
+- [x] **Phase 13**: 集成测试 + 端到端验证
+    - [x] 集成测试（undo/redo + sync + 性能采样）已接入
+    - [x] 端到端实机验证（Chrome 144 + RTX 4000 Ada + i7-14700 + 64GB，2026-02-11）
 
 ---
 
@@ -71,3 +74,5 @@
 - **旧 VTK.js 任务**: `doc/archive/vtk-task.md`
 - **旧 VTK.js 阶段 6 计划**: `doc/archive/vtk-phase6-implementation_plan.md`
 - **里程碑 1 归档**: `doc/archive/webgpu-phase0-5-completion.md`
+- **里程碑 4 归档**: `doc/archive/webgpu-phase11-13-completion.md`
+- **里程碑 4 补充归档（交互/union 跟进）**: `doc/archive/webgpu-phase11-13-followup-2026-02-11.md`

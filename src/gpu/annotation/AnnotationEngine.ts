@@ -5,6 +5,10 @@ import { ROIWriteToken } from './ROIWriteToken';
 import { ViewSyncCoordinator } from './ViewSyncCoordinator';
 import type {
     AnnotationCommitResult,
+    AnnotationHistoryEntry,
+    AnnotationHistoryKeyframe,
+    AnnotationHistorySnapshot,
+    AnnotationPerformanceSample,
     AnnotationStatus,
     BrushStroke,
     DirtyBrickEstimator,
@@ -28,10 +32,21 @@ export interface AnnotationEngineOptions {
     estimateDirtyBricks?: DirtyBrickEstimator;
     onStatus?: (status: AnnotationStatus) => void;
     onViewSync?: (event: ViewSyncEvent) => void;
+    onPerformanceSample?: (sample: AnnotationPerformanceSample) => void;
+    historyKeyframeInterval?: number;
+    historyLimit?: number;
     now?: () => number;
 }
 
+interface CommitExecutionOptions {
+    clearRedo: boolean;
+    recordHistory: boolean;
+    statusPrefix: 'commit' | 'undo' | 'redo';
+}
+
 const DEFAULT_INITIAL_VERTEX_CAPACITY = 1024;
+const DEFAULT_HISTORY_KEYFRAME_INTERVAL = 8;
+const DEFAULT_HISTORY_LIMIT = 6;
 
 class NoopSDFPipeline implements SDFPipelineLike {
     async previewStroke(): Promise<void> {
@@ -47,6 +62,9 @@ export class AnnotationEngine {
     private activeROI = 1;
     private brushRadiusMM = 5;
     private eraseMode = false;
+    private quantOriginVersion = 0;
+    private historySequence = 0;
+    private latestKeyframe: AnnotationHistoryKeyframe | undefined;
 
     private readonly scheduler: DirtyBrickScheduler;
     private readonly writeToken: ROIWriteToken;
@@ -55,7 +73,13 @@ export class AnnotationEngine {
     private readonly viewSyncCoordinator: ViewSyncCoordinatorLike;
     private readonly estimateDirtyBricks: DirtyBrickEstimator;
     private readonly onStatus?: (status: AnnotationStatus) => void;
+    private readonly onPerformanceSample?: (sample: AnnotationPerformanceSample) => void;
+    private readonly historyKeyframeInterval: number;
+    private readonly historyLimit: number;
     private readonly now: () => number;
+    private readonly history: AnnotationHistoryEntry[] = [];
+    private readonly redoStack: AnnotationHistoryEntry[] = [];
+    private readonly roiActiveDirtyBricks = new Map<number, Set<string>>();
     private sliceBounds: ViewSyncTargetMap = {
         axial: 512,
         sagittal: 512,
@@ -73,6 +97,9 @@ export class AnnotationEngine {
         });
         this.estimateDirtyBricks = options.estimateDirtyBricks ?? this.defaultDirtyBrickEstimator;
         this.onStatus = options.onStatus;
+        this.onPerformanceSample = options.onPerformanceSample;
+        this.historyKeyframeInterval = Math.max(1, options.historyKeyframeInterval ?? DEFAULT_HISTORY_KEYFRAME_INTERVAL);
+        this.historyLimit = Math.max(1, options.historyLimit ?? DEFAULT_HISTORY_LIMIT);
         this.now = options.now ?? (() => Date.now());
     }
 
@@ -107,11 +134,43 @@ export class AnnotationEngine {
         return this.activeROI;
     }
 
+    canUndo(): boolean {
+        return this.history.length > 0;
+    }
+
+    canRedo(): boolean {
+        return this.redoStack.length > 0;
+    }
+
+    getHistorySnapshot(): AnnotationHistorySnapshot {
+        return {
+            undoDepth: this.history.length,
+            redoDepth: this.redoStack.length,
+            latestKeyframe: this.latestKeyframe
+                ? {
+                    ...this.latestKeyframe,
+                    dirtyBrickKeys: [...this.latestKeyframe.dirtyBrickKeys],
+                }
+                : undefined,
+        };
+    }
+
     async previewStroke(centerMM: Vec3MM, viewType: MPRViewType): Promise<void> {
-        const stroke = this.buildStroke(centerMM, viewType, 'preview');
+        const startedAt = this.now();
+        const stroke = this.buildStroke(centerMM, viewType, 'preview', startedAt);
         const dirtyBrickKeys = this.estimateDirtyBricks(stroke);
         this.scheduler.enqueue(stroke.roiId, dirtyBrickKeys);
         await this.sdfPipeline.previewStroke(stroke);
+
+        const endedAt = this.now();
+        this.emitPerformanceSample({
+            metric: 'mousemove-preview',
+            durationMs: endedAt - startedAt,
+            timestamp: endedAt,
+            roiId: stroke.roiId,
+            viewType: stroke.viewType,
+        });
+
         this.emitStatus({
             phase: 'preview',
             roiId: stroke.roiId,
@@ -121,7 +180,73 @@ export class AnnotationEngine {
     }
 
     async commitStroke(centerMM: Vec3MM, viewType: MPRViewType): Promise<AnnotationCommitResult> {
-        const stroke = this.buildStroke(centerMM, viewType, 'commit');
+        const startedAt = this.now();
+        const stroke = this.buildStroke(centerMM, viewType, 'commit', startedAt);
+        return this.commitStrokeInternal(stroke, {
+            clearRedo: true,
+            recordHistory: true,
+            statusPrefix: 'commit',
+        });
+    }
+
+    async undoLast(): Promise<AnnotationCommitResult | null> {
+        const entry = this.history.pop();
+        if (!entry) {
+            return null;
+        }
+        if (entry.keyframe && this.latestKeyframe?.index === entry.keyframe.index) {
+            this.recomputeLatestKeyframe();
+        }
+
+        const inverseStroke = this.createReplayStroke(entry.stroke, !entry.stroke.erase);
+        try {
+            const result = await this.commitStrokeInternal(inverseStroke, {
+                clearRedo: false,
+                recordHistory: false,
+                statusPrefix: 'undo',
+            });
+            this.redoStack.push(entry);
+            if (this.redoStack.length > this.historyLimit) {
+                this.redoStack.shift();
+            }
+            return result;
+        } catch (error) {
+            this.history.push(entry);
+            if (entry.keyframe) {
+                this.latestKeyframe = entry.keyframe;
+            }
+            throw error;
+        }
+    }
+
+    async redoLast(): Promise<AnnotationCommitResult | null> {
+        const entry = this.redoStack.pop();
+        if (!entry) {
+            return null;
+        }
+
+        const redoStroke = this.createReplayStroke(entry.stroke, entry.stroke.erase);
+        try {
+            const result = await this.commitStrokeInternal(redoStroke, {
+                clearRedo: false,
+                recordHistory: false,
+                statusPrefix: 'redo',
+            });
+            this.history.push(entry);
+            if (entry.keyframe) {
+                this.latestKeyframe = entry.keyframe;
+            }
+            return result;
+        } catch (error) {
+            this.redoStack.push(entry);
+            throw error;
+        }
+    }
+
+    private async commitStrokeInternal(
+        stroke: BrushStroke,
+        options: CommitExecutionOptions
+    ): Promise<AnnotationCommitResult> {
         return this.writeToken.runExclusive(stroke.roiId, async () => {
             const ownDirtyBricks = this.estimateDirtyBricks(stroke);
             this.scheduler.enqueue(stroke.roiId, ownDirtyBricks);
@@ -163,6 +288,11 @@ export class AnnotationEngine {
                 totalIndexCount,
                 batches,
             };
+            const activeDirtyBricks = this.applyBooleanToROIState(
+                stroke.roiId,
+                processedDirtyBricks,
+                stroke.erase
+            );
 
             try {
                 result.viewSync = await this.viewSyncCoordinator.syncAfterCommit({
@@ -170,7 +300,7 @@ export class AnnotationEngine {
                     centerMM: stroke.centerMM,
                     brushRadiusMM: stroke.radiusMM,
                     erase: stroke.erase,
-                    dirtyBrickKeys: processedDirtyBricks,
+                    dirtyBrickKeys: activeDirtyBricks,
                     targets: this.resolveSyncTargets(stroke.centerMM),
                 });
             } catch (error) {
@@ -183,17 +313,39 @@ export class AnnotationEngine {
                 });
             }
 
+            if (options.recordHistory) {
+                this.pushHistoryEntry(stroke, processedDirtyBricks);
+                if (options.clearRedo) {
+                    this.redoStack.length = 0;
+                }
+            }
+
             this.emitStatus({
                 phase: 'commit',
                 roiId: stroke.roiId,
                 pendingDirtyBricks: this.scheduler.pendingCount(stroke.roiId),
-                message: `commit:${totalDirtyBricks}`,
+                message: `${options.statusPrefix}:${totalDirtyBricks}`,
             });
+
+            const endedAt = this.now();
+            this.emitPerformanceSample({
+                metric: 'mouseup-sync',
+                durationMs: endedAt - stroke.timestamp,
+                timestamp: endedAt,
+                roiId: stroke.roiId,
+                viewType: stroke.viewType,
+            });
+
             return result;
         });
     }
 
-    private buildStroke(centerMM: Vec3MM, viewType: MPRViewType, phase: 'preview' | 'commit'): BrushStroke {
+    private buildStroke(
+        centerMM: Vec3MM,
+        viewType: MPRViewType,
+        phase: 'preview' | 'commit',
+        timestamp: number
+    ): BrushStroke {
         return {
             roiId: this.activeROI,
             centerMM,
@@ -201,8 +353,73 @@ export class AnnotationEngine {
             erase: this.eraseMode,
             viewType,
             phase,
+            timestamp,
+        };
+    }
+
+    private createReplayStroke(original: BrushStroke, erase: boolean): BrushStroke {
+        return {
+            ...original,
+            erase,
+            phase: 'commit',
             timestamp: this.now(),
         };
+    }
+
+    private pushHistoryEntry(stroke: BrushStroke, dirtyBrickKeys: string[]): void {
+        this.historySequence += 1;
+        this.quantOriginVersion += 1;
+
+        const keyframe = this.createOptionalKeyframe(stroke, dirtyBrickKeys, this.historySequence);
+        const entry: AnnotationHistoryEntry = {
+            id: this.historySequence,
+            stroke: { ...stroke, centerMM: [...stroke.centerMM] as Vec3MM },
+            dirtyBrickKeys: [...dirtyBrickKeys],
+            createdAt: stroke.timestamp,
+            keyframe,
+        };
+
+        this.history.push(entry);
+        if (keyframe) {
+            this.latestKeyframe = keyframe;
+        }
+
+        if (this.history.length > this.historyLimit) {
+            const removed = this.history.shift();
+            if (removed?.keyframe && this.latestKeyframe?.index === removed.keyframe.index) {
+                this.recomputeLatestKeyframe();
+            }
+        }
+    }
+
+    private createOptionalKeyframe(
+        stroke: BrushStroke,
+        dirtyBrickKeys: string[],
+        index: number
+    ): AnnotationHistoryKeyframe | undefined {
+        if (index % this.historyKeyframeInterval !== 0) {
+            return undefined;
+        }
+        return {
+            index,
+            roiId: stroke.roiId,
+            activeROI: this.activeROI,
+            brushRadiusMM: this.brushRadiusMM,
+            eraseMode: this.eraseMode,
+            dirtyBrickKeys: [...dirtyBrickKeys],
+            quantOriginVersion: this.quantOriginVersion,
+        };
+    }
+
+    private recomputeLatestKeyframe(): void {
+        this.latestKeyframe = undefined;
+        for (let i = this.history.length - 1; i >= 0; i--) {
+            const keyframe = this.history[i].keyframe;
+            if (keyframe) {
+                this.latestKeyframe = keyframe;
+                break;
+            }
+        }
     }
 
     private readonly defaultDirtyBrickEstimator: DirtyBrickEstimator = (stroke) => {
@@ -227,12 +444,43 @@ export class AnnotationEngine {
         this.onStatus?.(status);
     }
 
+    private emitPerformanceSample(sample: AnnotationPerformanceSample): void {
+        this.onPerformanceSample?.({
+            ...sample,
+            durationMs: Math.max(0, sample.durationMs),
+        });
+    }
+
     private resolveSyncTargets(centerMM: Vec3MM): ViewSyncTargetMap {
         return {
             axial: this.worldToSliceIndex(centerMM[2], this.sliceBounds.axial),
             sagittal: this.worldToSliceIndex(centerMM[0], this.sliceBounds.sagittal),
             coronal: this.worldToSliceIndex(centerMM[1], this.sliceBounds.coronal),
         };
+    }
+
+    private applyBooleanToROIState(
+        roiId: number,
+        dirtyBrickKeys: DirtyBrickKey[],
+        erase: boolean
+    ): DirtyBrickKey[] {
+        let active = this.roiActiveDirtyBricks.get(roiId);
+        if (!active) {
+            active = new Set<string>();
+            this.roiActiveDirtyBricks.set(roiId, active);
+        }
+
+        if (erase) {
+            for (const key of dirtyBrickKeys) {
+                active.delete(key);
+            }
+        } else {
+            for (const key of dirtyBrickKeys) {
+                active.add(key);
+            }
+        }
+
+        return Array.from(active);
     }
 
     private worldToSliceIndex(worldMM: number, sliceCount: number): number {

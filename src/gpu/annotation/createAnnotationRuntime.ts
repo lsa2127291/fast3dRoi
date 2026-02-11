@@ -5,7 +5,12 @@ import { MPRSlicePipeline } from './MPRSlicePipeline';
 import { SDFBrickPool } from './SDFBrickPool';
 import { SDFGenerationPipeline } from './SDFGenerationPipeline';
 import { ViewSyncCoordinator } from './ViewSyncCoordinator';
-import type { AnnotationStatus, SDFPipelineLike, ViewSyncEvent } from './types';
+import type {
+    AnnotationPerformanceSample,
+    AnnotationStatus,
+    SDFPipelineLike,
+    ViewSyncEvent,
+} from './types';
 
 export interface AnnotationRuntime {
     engine: AnnotationEngine;
@@ -23,11 +28,13 @@ const noopSDFPipeline: SDFPipelineLike = {
 };
 
 const ENABLE_GPU_SDF_PIPELINE = false;
+const MAX_UNDO_REDO_DEPTH = 6;
 
 export function createAnnotationRuntime(
     ctx: WebGPUContext,
     onStatus?: (status: AnnotationStatus) => void,
-    onViewSync?: (event: ViewSyncEvent) => void
+    onViewSync?: (event: ViewSyncEvent) => void,
+    onPerformanceSample?: (sample: AnnotationPerformanceSample) => void
 ): AnnotationRuntime {
     let sdfPool: SDFBrickPool | null = null;
     let sdfPipeline: SDFGenerationPipeline | SDFPipelineLike = noopSDFPipeline;
@@ -48,6 +55,8 @@ export function createAnnotationRuntime(
         marchingCubes,
         viewSyncCoordinator,
         onStatus,
+        onPerformanceSample,
+        historyLimit: MAX_UNDO_REDO_DEPTH,
     });
 
     return {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectOverlayCircle } from './SliceOverlayProjector';
+import { computeCircularOverlayPixelRadii, projectOverlayCircle } from './SliceOverlayProjector';
 
 describe('SliceOverlayProjector', () => {
     it('should map axial world coordinates into normalized overlay space', () => {
@@ -34,5 +34,16 @@ describe('SliceOverlayProjector', () => {
         expect(sagittal.cy).toBeCloseTo(0.65, 5);
         expect(coronal.cx).toBeCloseTo(0.8, 5);
         expect(coronal.cy).toBeCloseTo(0.65, 5);
+    });
+
+    it('should keep projected brush radius circular on non-square viewport', () => {
+        const radii = computeCircularOverlayPixelRadii({
+            radiusNorm: 0.1,
+            viewportWidth: 800,
+            viewportHeight: 400,
+        });
+
+        expect(radii.rxPx).toBeCloseTo(40, 5);
+        expect(radii.ryPx).toBeCloseTo(40, 5);
     });
 });

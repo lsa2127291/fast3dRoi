@@ -133,6 +133,11 @@ export interface ExtendedVolumeSpaceConfig {
 /** 事件总线事件类型 */
 export interface EventMap {
     'slice:change': { viewType: ViewType; sliceIndex: number };
+    'perf:page-flip': {
+        viewType: 'axial' | 'sagittal' | 'coronal';
+        durationMs: number;
+        sliceIndex: number;
+    };
     'slice:sync': {
         roiId: number;
         budgetHit: boolean;
