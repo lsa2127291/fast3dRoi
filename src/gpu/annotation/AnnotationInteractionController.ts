@@ -96,9 +96,17 @@ export class AnnotationInteractionController {
         const nx = (event.clientX - rect.left) / width;
         const ny = (event.clientY - rect.top) / height;
 
-        const worldX = (nx - 0.5) * WORKSPACE_SIZE_MM;
-        const worldY = (0.5 - ny) * WORKSPACE_SIZE_MM;
-        const worldZ = 0;
-        return [worldX, worldY, worldZ];
+        const screenX = (nx - 0.5) * WORKSPACE_SIZE_MM;
+        const screenY = (0.5 - ny) * WORKSPACE_SIZE_MM;
+
+        // 根据视图类型映射到正确的 3D 世界坐标轴
+        switch (this.viewType) {
+            case 'axial':    // Z 切面：屏幕 X/Y → 世界 X/Y
+                return [screenX, screenY, 0];
+            case 'sagittal': // X 切面：屏幕 X/Y → 世界 Y/Z
+                return [0, screenX, screenY];
+            case 'coronal':  // Y 切面：屏幕 X/Y → 世界 X/Z
+                return [screenX, 0, screenY];
+        }
     }
 }

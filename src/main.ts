@@ -36,15 +36,15 @@ import type {
     AnnotationStatus,
     ViewSyncEvent,
 } from './gpu/annotation';
-import { packVertexQ } from './gpu/data/VertexQ'; 
-import type { VertexQEncoded } from './gpu/data/VertexQ'; 
-import { QUANT_STEP_MM, WORKSPACE_SIZE_MM } from './gpu/constants'; 
+import { packVertexQ } from './gpu/data/VertexQ';
+import type { VertexQEncoded } from './gpu/data/VertexQ';
+import { QUANT_STEP_MM, WORKSPACE_SIZE_MM } from './gpu/constants';
 import {
     computeCircularOverlayPixelRadii,
     projectOverlayCircle,
 } from './gpu/annotation/SliceOverlayProjector';
 import { SliceOverlayAccumulator } from './gpu/annotation/SliceOverlayAccumulator';
-import { eventBus } from './core/EventBus'; 
+import { eventBus } from './core/EventBus';
 
 // dcmjs 全局变量（通过 CDN 加载）
 declare const dcmjs: {
@@ -71,10 +71,13 @@ class VTKMPRView {
     private imageSlice: any = null;
     private windowWidth = 400;
     private windowCenter = 40;
-    private dimensions: number[] = [1, 1, 1]; 
-    private imageSpacing: number[] = [1, 1, 1]; 
-    private overlayCanvas: HTMLCanvasElement | null = null; 
-    private overlayContext: CanvasRenderingContext2D | null = null; 
+    private dimensions: number[] = [1, 1, 1];
+    private imageSpacing: number[] = [1, 1, 1];
+    private isMiddleButtonDown = false;
+    private initialParallelScale = 1;
+    private initialFocalPoint: [number, number, number] = [0, 0, 0];
+    private overlayCanvas: HTMLCanvasElement | null = null;
+    private overlayContext: CanvasRenderingContext2D | null = null;
     private overlayMaskCanvas: HTMLCanvasElement | null = null;
     private overlayMaskContext: CanvasRenderingContext2D | null = null;
     private overlayEdgeCanvas: HTMLCanvasElement | null = null;
@@ -182,9 +185,34 @@ class VTKMPRView {
             this.render();
         }).observe(this.container);
 
+        // 跟踪中键状态（用于中键+滚轮=缩放）
+        this.container.addEventListener('mousedown', (e) => {
+            if (e.button === 1) this.isMiddleButtonDown = true;
+        });
+        window.addEventListener('mouseup', (e) => {
+            if (e.button === 1) this.isMiddleButtonDown = false;
+        });
+
         // 鼠标滚轮事件
         this.container.addEventListener('wheel', (e) => {
             e.preventDefault();
+
+            // 中键按住 + 滚轮 = 缩放（平行投影用 parallelScale）
+            if (this.isMiddleButtonDown) {
+                const camera = this.renderer?.getActiveCamera();
+                if (camera) {
+                    const scale = camera.getParallelScale();
+                    // deltaY > 0 = 滚轮下 = 缩小（scale 变大）
+                    const factor = e.deltaY > 0 ? 1.1 : 0.9;
+                    camera.setParallelScale(scale * factor);
+                    this.renderer.resetCameraClippingRange();
+                    this.render();
+                    this.paintOverlay(); // 缩放后刷新 overlay
+                }
+                return;
+            }
+
+            // 普通滚轮 = 翻页
             if (!this.imageMapper) return;
             const delta = e.deltaY > 0 ? 1 : -1;
             const current = this.imageMapper.getSlice();
@@ -255,33 +283,43 @@ class VTKMPRView {
         this.resizeOverlayCanvas();
     }
 
+    // offscreen canvas 额外 padding（CSS 像素），防止缩放后椭圆超出 canvas 被裁剪
+    private static readonly OVERLAY_PAD = 300;
+
     private resizeOverlayCanvas(): void {
         if (!this.overlayCanvas || !this.overlayMaskCanvas || !this.overlayEdgeCanvas) return;
         const rect = this.container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         const pixelWidth = Math.max(1, Math.floor(rect.width * dpr));
         const pixelHeight = Math.max(1, Math.floor(rect.height * dpr));
+        const pad = VTKMPRView.OVERLAY_PAD;
+        const padPx = Math.ceil(pad * dpr);
+        const paddedW = pixelWidth + 2 * padPx;
+        const paddedH = pixelHeight + 2 * padPx;
 
+        // 可视 overlay canvas = viewport 大小
         if (this.overlayCanvas.width !== pixelWidth || this.overlayCanvas.height !== pixelHeight) {
             this.overlayCanvas.width = pixelWidth;
             this.overlayCanvas.height = pixelHeight;
             this.overlayCanvas.style.width = `${Math.floor(rect.width)}px`;
             this.overlayCanvas.style.height = `${Math.floor(rect.height)}px`;
         }
-        if (this.overlayMaskCanvas.width !== pixelWidth || this.overlayMaskCanvas.height !== pixelHeight) {
-            this.overlayMaskCanvas.width = pixelWidth;
-            this.overlayMaskCanvas.height = pixelHeight;
+        // offscreen mask/edge canvas = viewport + 2*pad（每边各扩展 pad）
+        if (this.overlayMaskCanvas.width !== paddedW || this.overlayMaskCanvas.height !== paddedH) {
+            this.overlayMaskCanvas.width = paddedW;
+            this.overlayMaskCanvas.height = paddedH;
         }
-        if (this.overlayEdgeCanvas.width !== pixelWidth || this.overlayEdgeCanvas.height !== pixelHeight) {
-            this.overlayEdgeCanvas.width = pixelWidth;
-            this.overlayEdgeCanvas.height = pixelHeight;
+        if (this.overlayEdgeCanvas.width !== paddedW || this.overlayEdgeCanvas.height !== paddedH) {
+            this.overlayEdgeCanvas.width = paddedW;
+            this.overlayEdgeCanvas.height = paddedH;
         }
 
         if (this.overlayContext) {
             this.overlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
         }
         if (this.overlayMaskContext) {
-            this.overlayMaskContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // 用 translate 把绘制原点偏移到 padding 区域内部，这样 CSS 坐标 (0,0) 对应 canvas 像素 (padPx, padPx)
+            this.overlayMaskContext.setTransform(dpr, 0, 0, dpr, padPx, padPx);
         }
         if (this.overlayEdgeContext) {
             this.overlayEdgeContext.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -313,9 +351,43 @@ class VTKMPRView {
         const maskCtx = this.overlayMaskContext;
         const edgeCtx = this.overlayEdgeContext;
         const mainCtx = this.overlayContext;
+        const pad = VTKMPRView.OVERLAY_PAD;
 
-        maskCtx.clearRect(0, 0, rect.width, rect.height);
+        // 清除 padded mask canvas
+        maskCtx.save();
+        maskCtx.setTransform(1, 0, 0, 1, 0, 0); // 临时重置变换来 clearRect 整个 canvas
+        maskCtx.clearRect(0, 0, this.overlayMaskCanvas.width, this.overlayMaskCanvas.height);
+        maskCtx.restore();
         maskCtx.globalCompositeOperation = 'source-over';
+
+        // 计算缩放/平移补偿：让 overlay 跟随 VTK.js 相机变化
+        const camera = this.renderer?.getActiveCamera();
+        let zoomRatio = 1;
+        let panOffsetX = 0;
+        let panOffsetY = 0;
+        if (camera && this.initialParallelScale > 0) {
+            const currentScale = camera.getParallelScale();
+            zoomRatio = this.initialParallelScale / currentScale;
+
+            const fp = camera.getFocalPoint();
+            const pxPerMM = Math.min(rect.width, rect.height) / (2 * this.initialParallelScale);
+            switch (this.viewType) {
+                case 'axial':
+                    panOffsetX = -(fp[0] - this.initialFocalPoint[0]) * pxPerMM * zoomRatio;
+                    panOffsetY = (fp[1] - this.initialFocalPoint[1]) * pxPerMM * zoomRatio;
+                    break;
+                case 'sagittal':
+                    panOffsetX = -(fp[1] - this.initialFocalPoint[1]) * pxPerMM * zoomRatio;
+                    panOffsetY = -(fp[2] - this.initialFocalPoint[2]) * pxPerMM * zoomRatio;
+                    break;
+                case 'coronal':
+                    panOffsetX = -(fp[0] - this.initialFocalPoint[0]) * pxPerMM * zoomRatio;
+                    panOffsetY = -(fp[2] - this.initialFocalPoint[2]) * pxPerMM * zoomRatio;
+                    break;
+            }
+        }
+
+        // 在 padded canvas 上绘制椭圆（坐标系已被 setTransform 偏移了 pad）
         for (const op of ops) {
             const projected = projectOverlayCircle({
                 viewType: this.viewType,
@@ -323,16 +395,19 @@ class VTKMPRView {
                 radiusMM: op.radiusMM,
                 workspaceSizeMM: WORKSPACE_SIZE_MM,
             });
-            const cx = projected.cx * rect.width;
-            const cy = projected.cy * rect.height;
             const radii = computeCircularOverlayPixelRadii({
                 radiusNorm: Math.max(projected.rx, projected.ry),
                 viewportWidth: rect.width,
                 viewportHeight: rect.height,
                 minRadiusPx: 2,
             });
-            const rx = radii.rxPx;
-            const ry = radii.ryPx;
+
+            const baseCx = projected.cx * rect.width;
+            const baseCy = projected.cy * rect.height;
+            const cx = (baseCx - rect.width / 2) * zoomRatio + rect.width / 2 + panOffsetX;
+            const cy = (baseCy - rect.height / 2) * zoomRatio + rect.height / 2 + panOffsetY;
+            const rx = radii.rxPx * zoomRatio;
+            const ry = radii.ryPx * zoomRatio;
 
             maskCtx.beginPath();
             maskCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
@@ -347,7 +422,10 @@ class VTKMPRView {
         }
         maskCtx.globalCompositeOperation = 'source-over';
 
-        const maskImage = maskCtx.getImageData(0, 0, Math.max(1, Math.floor(rect.width)), Math.max(1, Math.floor(rect.height)));
+        // 读取完整 padded canvas 数据进行形态学处理
+        const fullW = this.overlayMaskCanvas.width;
+        const fullH = this.overlayMaskCanvas.height;
+        const maskImage = maskCtx.getImageData(0, 0, fullW, fullH);
         this.binarizeMask(maskImage.data);
         this.closeMask(maskImage.data, maskImage.width, maskImage.height);
         maskCtx.putImageData(maskImage, 0, 0);
@@ -356,17 +434,25 @@ class VTKMPRView {
         this.extractMaskEdges(maskImage.data, edgeImage.data, maskImage.width, maskImage.height);
         edgeCtx.putImageData(edgeImage, 0, 0);
 
-        // 先绘制合并后的填充区域（union 后单一面）
+        // 从 padded canvas 中提取 viewport 区域合成到可视 canvas
+        const dpr = window.devicePixelRatio || 1;
+        const padPx = Math.ceil(pad * dpr);
+        const srcX = padPx;
+        const srcY = padPx;
+        const srcW = Math.max(1, Math.floor(rect.width * dpr));
+        const srcH = Math.max(1, Math.floor(rect.height * dpr));
+
+        // 填充区域
         mainCtx.save();
-        mainCtx.drawImage(this.overlayMaskCanvas, 0, 0, rect.width, rect.height);
+        mainCtx.drawImage(this.overlayMaskCanvas, srcX, srcY, srcW, srcH, 0, 0, rect.width, rect.height);
         mainCtx.globalCompositeOperation = 'source-in';
         mainCtx.fillStyle = 'rgba(0, 224, 255, 0.22)';
         mainCtx.fillRect(0, 0, rect.width, rect.height);
         mainCtx.restore();
 
-        // 绘制二值掩膜提取到的边界（只保留合并轮廓）
+        // 轮廓线
         mainCtx.save();
-        mainCtx.drawImage(this.overlayEdgeCanvas, 0, 0, rect.width, rect.height);
+        mainCtx.drawImage(this.overlayEdgeCanvas, srcX, srcY, srcW, srcH, 0, 0, rect.width, rect.height);
         mainCtx.globalCompositeOperation = 'source-in';
         mainCtx.fillStyle = 'rgba(0, 224, 255, 0.96)';
         mainCtx.fillRect(0, 0, rect.width, rect.height);
@@ -431,8 +517,9 @@ class VTKMPRView {
 
     private erodeBinaryMask(src: Uint8Array, dst: Uint8Array, width: number, height: number): void {
         const isOn = (x: number, y: number): boolean => {
+            // 越界视为 on，避免闭运算在画布边界侵蚀掩膜
             if (x < 0 || y < 0 || x >= width || y >= height) {
-                return false;
+                return true;
             }
             return src[y * width + x] > 0;
         };
@@ -460,7 +547,8 @@ class VTKMPRView {
         height: number
     ): void {
         const isOn = (x: number, y: number): boolean => {
-            if (x < 0 || y < 0 || x >= width || y >= height) return false;
+            // 越界视为 on，避免在画布边界产生假轮廓
+            if (x < 0 || y < 0 || x >= width || y >= height) return true;
             return mask[(y * width + x) * 4 + 3] > 0;
         };
 
@@ -555,6 +643,11 @@ class VTKMPRView {
 
         this.renderer.resetCamera();
         this.renderer.resetCameraClippingRange();
+
+        // 记录初始缩放和焦点，用于 overlay 补偿
+        this.initialParallelScale = camera.getParallelScale();
+        const fp = camera.getFocalPoint();
+        this.initialFocalPoint = [fp[0], fp[1], fp[2]];
     }
 
     setWindowLevel(ww: number, wc: number): void {
@@ -570,16 +663,16 @@ class VTKMPRView {
         const maxSlice = this.getMaxSlice();
         const newSlice = Math.max(0, Math.min(maxSlice, Math.floor(index)));
         this.imageMapper.setSlice(newSlice);
-        this.render(); 
-        this.updateLabel(); 
+        this.render();
+        this.updateLabel();
         this.paintOverlay();
 
-        if (emitEvent) { 
-            eventBus.emit('slice:change', { 
-                viewType: this.viewType, 
-                sliceIndex: newSlice, 
-            }); 
-        } 
+        if (emitEvent) {
+            eventBus.emit('slice:change', {
+                viewType: this.viewType,
+                sliceIndex: newSlice,
+            });
+        }
     }
 
     getSlice(): number {
@@ -596,20 +689,20 @@ class VTKMPRView {
         erase: boolean,
         sliceIndex = this.getSlice()
     ): void {
-        this.ensureOverlayLayer(); 
+        this.ensureOverlayLayer();
         this.overlayAccumulator.append({
             sliceIndex,
-            centerMM: [...centerMM] as [number, number, number], 
-            radiusMM, 
-            erase, 
+            centerMM: [...centerMM] as [number, number, number],
+            radiusMM,
+            erase,
         });
-        this.paintOverlay(); 
-    } 
+        this.paintOverlay();
+    }
 
-    clearAnnotationOverlay(): void { 
+    clearAnnotationOverlay(): void {
         this.overlayAccumulator.clear();
-        this.clearOverlayCanvas(); 
-    } 
+        this.clearOverlayCanvas();
+    }
 
     private updateWindowLevel(): void {
         if (!this.imageSlice) return;
@@ -1246,12 +1339,13 @@ function setupEventBusIntegration(): void {
         updateSliceSyncStatus(`切片变化: ${viewType} -> ${sliceIndex + 1} | flip ${durationMs.toFixed(1)}ms`);
     });
 
-    eventBus.on('slice:sync', (payload) => { 
-        for (const target of payload.targets) { 
-            const view = views.get(target.viewType); 
-            view?.setSlice(target.sliceIndex, false); 
-            view?.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, target.sliceIndex); 
-        } 
+    eventBus.on('slice:sync', (payload) => {
+        for (const target of payload.targets) {
+            const view = views.get(target.viewType);
+            if (!view) continue;
+            // 不改变视图切片，在各视图的当前切片上渲染 overlay
+            view.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, view.getSlice());
+        }
 
         annotationPerformanceTracker.recordDiagnostics({
             overflowCount: payload.overflow,
@@ -1337,6 +1431,10 @@ function setupROIControls(): void {
         if (!annotationRuntime) {
             return;
         }
+        // 先清除所有视图的 overlay，避免 undo 后残留痕迹
+        for (const view of views.values()) {
+            view.clearAnnotationOverlay();
+        }
         await annotationRuntime.engine.undoLast();
         updateHistoryStatus();
         updateHistoryControlsState();
@@ -1345,6 +1443,10 @@ function setupROIControls(): void {
     const executeRedo = async (): Promise<void> => {
         if (!annotationRuntime) {
             return;
+        }
+        // 先清除所有视图的 overlay，避免 redo 后残留痕迹
+        for (const view of views.values()) {
+            view.clearAnnotationOverlay();
         }
         await annotationRuntime.engine.redoLast();
         updateHistoryStatus();
