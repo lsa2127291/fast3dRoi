@@ -29,3 +29,6 @@ export * from './pipelines';
 
 // 渲染器
 export { WebGPURenderer } from './WebGPURenderer';
+
+// 勾画核心（里程碑2）
+export * from './annotation';

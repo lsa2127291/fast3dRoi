@@ -52,9 +52,9 @@ struct VertexOutput {
 fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let idx = index_pool[vid];
     let v = vertex_pool[idx];
-    let meta = quant_meta[0u];
+    let qmeta = quant_meta[0u];
 
-    let pos_mm = decode_vertex(v, meta);
+    let pos_mm = decode_vertex(v, qmeta);
 
     var out: VertexOutput;
     out.position = uniforms.mvp * vec4<f32>(pos_mm, 1.0);

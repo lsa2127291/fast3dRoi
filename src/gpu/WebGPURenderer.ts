@@ -108,6 +108,7 @@ export class WebGPURenderer {
     private isDragging = false;
     private lastMouseX = 0;
     private lastMouseY = 0;
+    private resizeObserver: ResizeObserver | null = null;
 
     // Render loop
     private animFrameId = 0;
@@ -115,6 +116,34 @@ export class WebGPURenderer {
 
     private readonly ctx: WebGPUContext;
     private container: HTMLElement | null = null;
+    private readonly onMouseDown = (e: MouseEvent): void => {
+        if (e.button === 0) { // 左键旋转
+            this.isDragging = true;
+            this.lastMouseX = e.clientX;
+            this.lastMouseY = e.clientY;
+        }
+    };
+    private readonly onMouseMove = (e: MouseEvent): void => {
+        if (!this.isDragging) return;
+        const dx = e.clientX - this.lastMouseX;
+        const dy = e.clientY - this.lastMouseY;
+        this.lastMouseX = e.clientX;
+        this.lastMouseY = e.clientY;
+
+        this.cameraRotY += dx * 0.005;
+        this.cameraRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01,
+            this.cameraRotX - dy * 0.005));
+        this.needsRender = true;
+    };
+    private readonly onMouseUp = (): void => {
+        this.isDragging = false;
+    };
+    private readonly onMouseWheel = (e: WheelEvent): void => {
+        e.preventDefault();
+        const factor = e.deltaY > 0 ? 1.1 : 0.9;
+        this.cameraDistance = Math.max(10, Math.min(5000, this.cameraDistance * factor));
+        this.needsRender = true;
+    };
 
     constructor(ctx: WebGPUContext) {
         this.ctx = ctx;
@@ -154,10 +183,12 @@ export class WebGPURenderer {
         this.uniformBindGroup = this.pipeline.createUniformBindGroup();
 
         // 监听窗口大小变化
-        new ResizeObserver(() => {
+        this.resizeObserver?.disconnect();
+        this.resizeObserver = new ResizeObserver(() => {
             this.updateSize();
             this.needsRender = true;
-        }).observe(container);
+        });
+        this.resizeObserver.observe(container);
 
         // 绑定鼠标交互
         this.setupInteraction();
@@ -335,11 +366,16 @@ export class WebGPURenderer {
         this.needsRender = true;
     }
 
+    getCanvasElement(): HTMLCanvasElement | null {
+        return this.canvas;
+    }
+
     /**
      * 销毁渲染器
      */
     destroy(): void {
         this.stopRenderLoop();
+        this.teardownInteraction();
         this.pipeline?.destroy();
         this.vertexBuffer?.destroy();
         this.indexBuffer?.destroy();
@@ -349,7 +385,16 @@ export class WebGPURenderer {
             this.container.removeChild(this.canvas);
         }
         this.canvas = null;
+        this.container = null;
         this.gpuContext = null;
+        this.depthTexture = null;
+        this.vertexBuffer = null;
+        this.indexBuffer = null;
+        this.quantMetaBuffer = null;
+        this.pipeline = null;
+        this.storageBindGroup = null;
+        this.uniformBindGroup = null;
+        this.indexCount = 0;
     }
 
     // ========== 内部方法 ==========
@@ -390,37 +435,23 @@ export class WebGPURenderer {
         if (!this.canvas) return;
 
         // 鼠标拖拽旋转
-        this.canvas.addEventListener('mousedown', (e) => {
-            if (e.button === 0) { // 左键旋转
-                this.isDragging = true;
-                this.lastMouseX = e.clientX;
-                this.lastMouseY = e.clientY;
-            }
-        });
-
-        window.addEventListener('mousemove', (e) => {
-            if (!this.isDragging) return;
-            const dx = e.clientX - this.lastMouseX;
-            const dy = e.clientY - this.lastMouseY;
-            this.lastMouseX = e.clientX;
-            this.lastMouseY = e.clientY;
-
-            this.cameraRotY += dx * 0.005;
-            this.cameraRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01,
-                this.cameraRotX - dy * 0.005));
-            this.needsRender = true;
-        });
-
-        window.addEventListener('mouseup', () => {
-            this.isDragging = false;
-        });
+        this.canvas.addEventListener('mousedown', this.onMouseDown);
+        window.addEventListener('mousemove', this.onMouseMove);
+        window.addEventListener('mouseup', this.onMouseUp);
 
         // 滚轮缩放
-        this.canvas.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            const factor = e.deltaY > 0 ? 1.1 : 0.9;
-            this.cameraDistance = Math.max(10, Math.min(5000, this.cameraDistance * factor));
-            this.needsRender = true;
-        });
+        this.canvas.addEventListener('wheel', this.onMouseWheel);
+    }
+
+    private teardownInteraction(): void {
+        if (this.canvas) {
+            this.canvas.removeEventListener('mousedown', this.onMouseDown);
+            this.canvas.removeEventListener('wheel', this.onMouseWheel);
+        }
+        window.removeEventListener('mousemove', this.onMouseMove);
+        window.removeEventListener('mouseup', this.onMouseUp);
+        this.resizeObserver?.disconnect();
+        this.resizeObserver = null;
+        this.isDragging = false;
     }
 }

@@ -1,53 +1,73 @@
-# 医疗图像可视化系统 - 任务清单
+# WebGPU 勾画系统 — 任务清单
 
-## 阶段一：项目基础架构
-- [x] 项目初始化与依赖配置
-- [x] 目录结构设计
-- [x] VTK.js 核心环境搭建
+## 里程碑 1: WebGPU 基础渲染管线 ✅ 已完成
 
-## 阶段二：数据加载层
-- [x] DICOM 文件解析模块
-- [x] NIfTI 文件解析模块
-- [x] 体数据统一抽象层
+- [x] **Phase 0**: 工具链配置（@webgpu/types, WGSL 构建支持）
+- [x] **Phase 1**: 移除旧 VTK.js 勾画模块（~2,400 行）
+- [x] **Phase 2**: Fail-Fast 初始化 + 全局常量（WebGPUContext, constants）
+- [x] **Phase 3**: 数据模型（VertexQ 量化编解码, ResourcePools, ChunkTable, WGSL structs）
+- [x] **Phase 4**: 基础渲染管线（WGSL shader, BasicRenderPipeline, WebGPURenderer）
+- [x] **Phase 5**: 集成到应用（测试立方体, 鼠标交互, 错误处理）
 
-## 阶段三：MPR 三视图
-- [x] 渲染引擎核心架构
-- [x] Axial（轴位）视图
-- [x] Sagittal（矢状位）视图
-- [x] Coronal（冠状位）视图
-- [x] 三视图交互联动
+> 归档详情: `doc/archive/webgpu-phase0-5-completion.md`
 
-## 阶段四：ROI 勾画系统
-- [x] 3D 分割数据结构设计（支持100个ROI）
-- [x] 显存优化策略实现
-- [x] Phase 4: 2D Brush Tool & ROI Real-time Sync
-    - [x] Implement [BrushTool](file:///f:/workspace/threejs-demo/src/annotation/BrushTool.ts#24-243) class (circle/square shapes, radius)
-    - [x] Implement [SparseROIManager](file:///f:/workspace/threejs-demo/src/annotation/SparseROIManager.ts#19-676) for voxel storage
-    - [x] Integrate brush drawing with VTK.js `onModified` events
-    - [x] **Refinement**: Implement continuous solid stroke drawing
-    - [x] **Refinement**: Rebind VTK keys (Left=Pan, Right=WL)
-    - [x] **Fix**: Canvas 坐标系修复（Sagittal/Coronal 圆形绘制）
+---
 
-## 阶段五：ROI 3D 可视化 ✅ 已完成
-- [x] **5.1 Marching Cubes 表面重建**
-- [x] **5.2 VTK.js 3D 渲染集成**
-- [x] **5.3 3D 场景交互**
-- [x] **5.4 笔刷实时更新 3D 视图**
-- [x] **5.5 修复块边界裂缝问题**
+## 里程碑 2: GPU 勾画核心 ✅ 已完成
 
-## 阶段六：性能优化（当前阶段）
-- [ ] **6.1 3D 网格增量更新**
-    - [ ] 跟踪脏块（dirty blocks）
-    - [ ] 仅重建受影响区域的网格
-    - [ ] 合并增量网格到全局 PolyData
-- [ ] **6.2 内存管理优化**
-    - [ ] 空块自动清理
-    - [ ] 大数据集分页加载
-    - [ ] 纹理内存监控
-- [ ] **6.3 LOD 动态调整**
-    - [ ] 基于相机距离的网格简化
-    - [ ] 渲染性能自适应
+- [x] **Phase 6**: SDF Bricks 存储
+    - [x] r16float 3D 纹理（Ping-Pong 双缓冲）
+    - [x] SDF 生成 compute shader
+    - [x] 砖块分配与管理
+- [x] **Phase 7**: GPU Marching Cubes
+    - [x] Weighted MC compute shader
+    - [x] Subgroup ballot 压缩写入（§3.1）
+    - [x] Overflow/quantOverflow 检测与重跑（§3.2, §6.1）
+- [x] **Phase 8**: 交互编辑管线
+    - [x] 鼠标事件捕获与坐标转换
+    - [x] 两阶段交互（move 预览 + mouseup 提交）
+    - [x] 脏砖调度（dirty_limit=24）
+    - [x] ROIWriteToken 并发控制
 
-## 阶段七：集成与测试
-- [ ] 端到端功能测试
-- [ ] 性能基准测试
+> 归档详情: `doc/archive/webgpu-phase6-8-completion.md`
+ 
+---
+
+## 里程碑 3: MPR 切面 + 同步 ✅ 已完成
+
+- [x] **Phase 9**: MPR 切面管线
+    - [x] GPU compute 三角形-平面求交（当前先落地切面管线抽象与默认调度核，保留 WebGPU compute 接入位）
+    - [x] Subgroup ballot + 压缩写入（通过切面 dispatch 接口建模压缩写入计数，后续可替换为真实 subgroup kernel）
+    - [x] 切面预算策略（稳帧）
+- [x] **Phase 10**: 三视图同步（§5）
+    - [x] 切面联动
+    - [x] 事件总线集成
+
+---
+
+## 里程碑 4: 完善与优化（待开展）
+
+- [ ] **Phase 11**: 撤销/重做（§7）
+- [ ] **Phase 12**: 性能目标验证（§8）
+    - [ ] mousemove 预览 ≤ 30ms
+    - [ ] 翻页切面 ≤ 60ms
+    - [ ] mouseup 后三视图同步 ≤ 300ms
+- [ ] **Phase 13**: 集成测试 + 端到端验证
+
+---
+
+## 技术债务
+
+- [ ] 法线计算（当前占位 `(0,0,1)`）
+- [ ] VertexQ 编解码单元测试
+- [ ] device.lost 自动重建
+- [ ] timestamp-query 性能面板
+
+---
+
+## 参考文档
+
+- **架构设计**: `doc/仿 RayStation 勾画架构文档 2.4.md`
+- **旧 VTK.js 任务**: `doc/archive/vtk-task.md`
+- **旧 VTK.js 阶段 6 计划**: `doc/archive/vtk-phase6-implementation_plan.md`
+- **里程碑 1 归档**: `doc/archive/webgpu-phase0-5-completion.md`

@@ -133,6 +133,21 @@ export interface ExtendedVolumeSpaceConfig {
 /** 事件总线事件类型 */
 export interface EventMap {
     'slice:change': { viewType: ViewType; sliceIndex: number };
+    'slice:sync': {
+        roiId: number;
+        budgetHit: boolean;
+        totalLineCount: number;
+        totalDeferredLines: number;
+        centerMM: Vec3;
+        brushRadiusMM: number;
+        erase: boolean;
+        targets: Array<{
+            viewType: 'axial' | 'sagittal' | 'coronal';
+            sliceIndex: number;
+            lineCount: number;
+            deferredLines: number;
+        }>;
+    };
     'window:change': { windowWidth: number; windowCenter: number };
     'roi:paint': { roiId: number; voxels: Vec3[] };
     'roi:visibility': { roiId: number; visible: boolean };

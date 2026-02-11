@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 医疗图像可视化系统 - 主入口
  * Phase 2: 集成 VTK.js 渲染管线（ES Module 导入）
  */
@@ -24,9 +24,16 @@ import { SlicingMode } from '@kitware/vtk.js/Rendering/Core/ImageMapper/Constant
 // WebGPU 渲染系统
 import { initWebGPU, WebGPUInitError } from './gpu/WebGPUContext';
 import { WebGPURenderer } from './gpu/WebGPURenderer';
+import {
+    AnnotationInteractionController,
+    createAnnotationRuntime,
+} from './gpu/annotation';
+import type { AnnotationRuntime, AnnotationStatus, ViewSyncEvent } from './gpu/annotation';
 import { packVertexQ } from './gpu/data/VertexQ';
 import type { VertexQEncoded } from './gpu/data/VertexQ';
-import { QUANT_STEP_MM } from './gpu/constants';
+import { QUANT_STEP_MM, WORKSPACE_SIZE_MM } from './gpu/constants';
+import { projectOverlayCircle } from './gpu/annotation/SliceOverlayProjector';
+import { eventBus } from './core/EventBus';
 
 // dcmjs 全局变量（通过 CDN 加载）
 declare const dcmjs: {
@@ -55,6 +62,9 @@ class VTKMPRView {
     private windowCenter = 40;
     private dimensions: number[] = [1, 1, 1];
     private imageSpacing: number[] = [1, 1, 1];
+    private overlayCanvas: HTMLCanvasElement | null = null;
+    private overlayContext: CanvasRenderingContext2D | null = null;
+    private overlayState: { centerMM: [number, number, number]; radiusMM: number; erase: boolean } | null = null;
 
     constructor(container: HTMLElement, viewType: ViewType) {
         this.container = container;
@@ -149,6 +159,7 @@ class VTKMPRView {
 
         // 设置相机
         this.setupCamera();
+        this.ensureOverlayLayer();
 
         // 监听窗口大小变化
         new ResizeObserver(() => {
@@ -162,15 +173,11 @@ class VTKMPRView {
             if (!this.imageMapper) return;
             const delta = e.deltaY > 0 ? 1 : -1;
             const current = this.imageMapper.getSlice();
-            const maxSlice = this.getMaxSlice();
-            const newSlice = Math.max(0, Math.min(maxSlice, current + delta));
-            this.imageMapper.setSlice(newSlice);
-            this.render();
-            this.updateLabel();
+            this.setSlice(current + delta, true);
         });
     }
 
-    private getMaxSlice(): number {
+    getMaxSlice(): number {
         switch (this.viewType) {
             case 'axial': return this.dimensions[2] - 1;
             case 'sagittal': return this.dimensions[0] - 1;
@@ -206,6 +213,75 @@ class VTKMPRView {
         if (!this.openGLRenderWindow) return;
         const { width, height } = this.container.getBoundingClientRect();
         this.openGLRenderWindow.setSize(Math.floor(width), Math.floor(height));
+        this.resizeOverlayCanvas();
+        this.paintOverlay();
+    }
+
+    private ensureOverlayLayer(): void {
+        if (this.overlayCanvas) {
+            return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:3;';
+        this.container.appendChild(canvas);
+        this.overlayCanvas = canvas;
+        this.overlayContext = canvas.getContext('2d');
+        this.resizeOverlayCanvas();
+    }
+
+    private resizeOverlayCanvas(): void {
+        if (!this.overlayCanvas) return;
+        const rect = this.container.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const pixelWidth = Math.max(1, Math.floor(rect.width * dpr));
+        const pixelHeight = Math.max(1, Math.floor(rect.height * dpr));
+
+        if (this.overlayCanvas.width !== pixelWidth || this.overlayCanvas.height !== pixelHeight) {
+            this.overlayCanvas.width = pixelWidth;
+            this.overlayCanvas.height = pixelHeight;
+            this.overlayCanvas.style.width = `${Math.floor(rect.width)}px`;
+            this.overlayCanvas.style.height = `${Math.floor(rect.height)}px`;
+        }
+
+        if (this.overlayContext) {
+            this.overlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+    }
+
+    private clearOverlayCanvas(): void {
+        if (!this.overlayContext) return;
+        const rect = this.container.getBoundingClientRect();
+        this.overlayContext.clearRect(0, 0, rect.width, rect.height);
+    }
+
+    private paintOverlay(): void {
+        this.clearOverlayCanvas();
+        if (!this.overlayContext || !this.overlayState) return;
+
+        const rect = this.container.getBoundingClientRect();
+        const projected = projectOverlayCircle({
+            viewType: this.viewType,
+            centerMM: this.overlayState.centerMM,
+            radiusMM: this.overlayState.radiusMM,
+            workspaceSizeMM: WORKSPACE_SIZE_MM,
+        });
+
+        const cx = projected.cx * rect.width;
+        const cy = projected.cy * rect.height;
+        const rx = Math.max(2, projected.rx * rect.width);
+        const ry = Math.max(2, projected.ry * rect.height);
+
+        this.overlayContext.beginPath();
+        this.overlayContext.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        this.overlayContext.lineWidth = 2;
+        this.overlayContext.strokeStyle = this.overlayState.erase
+            ? 'rgba(255, 196, 0, 0.95)'
+            : 'rgba(0, 224, 255, 0.95)';
+        this.overlayContext.fillStyle = this.overlayState.erase
+            ? 'rgba(255, 196, 0, 0.12)'
+            : 'rgba(0, 224, 255, 0.12)';
+        this.overlayContext.fill();
+        this.overlayContext.stroke();
     }
 
     setImageData(imageData: any): void {
@@ -225,6 +301,7 @@ class VTKMPRView {
 
         this.render();
         this.updateLabel();
+        this.clearAnnotationOverlay();
     }
 
     private setupCameraForData(imageData: any): void {
@@ -279,6 +356,47 @@ class VTKMPRView {
         this.windowCenter = wc;
         this.updateWindowLevel();
         this.render();
+    }
+
+    setSlice(index: number, emitEvent = false): void {
+        if (!this.imageMapper) return;
+
+        const maxSlice = this.getMaxSlice();
+        const newSlice = Math.max(0, Math.min(maxSlice, Math.floor(index)));
+        this.imageMapper.setSlice(newSlice);
+        this.render();
+        this.updateLabel();
+
+        if (emitEvent) {
+            this.clearAnnotationOverlay();
+            eventBus.emit('slice:change', {
+                viewType: this.viewType,
+                sliceIndex: newSlice,
+            });
+        }
+    }
+
+    getSlice(): number {
+        return this.imageMapper?.getSlice() ?? 0;
+    }
+
+    getSliceCount(): number {
+        return this.getMaxSlice() + 1;
+    }
+
+    renderAnnotationOverlay(centerMM: [number, number, number], radiusMM: number, erase: boolean): void {
+        this.ensureOverlayLayer();
+        this.overlayState = {
+            centerMM: [...centerMM] as [number, number, number],
+            radiusMM,
+            erase,
+        };
+        this.paintOverlay();
+    }
+
+    clearAnnotationOverlay(): void {
+        this.overlayState = null;
+        this.clearOverlayCanvas();
     }
 
     private updateWindowLevel(): void {
@@ -540,6 +658,97 @@ function createTestCube(): { vertices: VertexQEncoded[]; indices: number[] } {
 }
 
 let webgpuRenderer: WebGPURenderer | null = null;
+let annotationRuntime: AnnotationRuntime | null = null;
+let annotationController: AnnotationInteractionController | null = null;
+
+function updateAnnotationStatus(status: AnnotationStatus): void {
+    const statsInfo = document.getElementById('stats-info');
+    if (!statsInfo) return;
+
+    let line = document.getElementById('annotation-status-line');
+    if (!line) {
+        line = document.createElement('div');
+        line.id = 'annotation-status-line';
+        line.style.marginTop = '8px';
+        line.style.color = 'var(--accent)';
+        statsInfo.appendChild(line);
+    }
+
+    line.textContent = `勾画状态: ${status.phase} | ROI ${status.roiId} | dirty ${status.pendingDirtyBricks}`;
+}
+
+function updateSliceSyncStatus(text: string): void {
+    const statsInfo = document.getElementById('stats-info');
+    if (!statsInfo) return;
+
+    let line = document.getElementById('slice-sync-status-line');
+    if (!line) {
+        line = document.createElement('div');
+        line.id = 'slice-sync-status-line';
+        line.style.marginTop = '4px';
+        line.style.color = 'var(--text-secondary)';
+        statsInfo.appendChild(line);
+    }
+    line.textContent = text;
+}
+
+function emitViewSyncToEventBus(event: ViewSyncEvent): void {
+    eventBus.emit('slice:sync', {
+        roiId: event.roiId,
+        budgetHit: event.budgetHit,
+        totalLineCount: event.totalLineCount,
+        totalDeferredLines: event.totalDeferredLines,
+        centerMM: event.centerMM,
+        brushRadiusMM: event.brushRadiusMM,
+        erase: event.erase,
+        targets: [
+            {
+                viewType: 'axial',
+                sliceIndex: event.viewResults.axial.sliceIndex,
+                lineCount: event.viewResults.axial.lineCount,
+                deferredLines: event.viewResults.axial.deferredLines,
+            },
+            {
+                viewType: 'sagittal',
+                sliceIndex: event.viewResults.sagittal.sliceIndex,
+                lineCount: event.viewResults.sagittal.lineCount,
+                deferredLines: event.viewResults.sagittal.deferredLines,
+            },
+            {
+                viewType: 'coronal',
+                sliceIndex: event.viewResults.coronal.sliceIndex,
+                lineCount: event.viewResults.coronal.lineCount,
+                deferredLines: event.viewResults.coronal.deferredLines,
+            },
+        ],
+    });
+}
+
+function syncAnnotationControlsToEngine(): void {
+    if (!annotationRuntime) return;
+
+    const roiSelect = document.getElementById('roi-select') as HTMLSelectElement | null;
+    const brushSizeInput = document.getElementById('brush-size') as HTMLInputElement | null;
+    const eraseModeInput = document.getElementById('erase-mode') as HTMLInputElement | null;
+
+    if (roiSelect) {
+        const roiId = parseInt(roiSelect.value, 10);
+        if (!Number.isNaN(roiId)) {
+            annotationRuntime.engine.setActiveROI(roiId);
+        }
+    }
+
+    if (brushSizeInput) {
+        const size = parseInt(brushSizeInput.value, 10);
+        if (!Number.isNaN(size)) {
+            annotationRuntime.engine.setBrushRadius(size);
+        }
+    }
+
+    if (eraseModeInput) {
+        annotationRuntime.engine.setEraseMode(eraseModeInput.checked);
+    }
+}
 
 /** 初始化 WebGPU 3D 视图 */
 async function initializeWebGPUView(): Promise<void> {
@@ -551,6 +760,13 @@ async function initializeWebGPUView(): Promise<void> {
 
     try {
         // 初始化 WebGPU 上下文
+        annotationController?.detach();
+        annotationController = null;
+        annotationRuntime?.destroy();
+        annotationRuntime = null;
+        webgpuRenderer?.destroy();
+        webgpuRenderer = null;
+
         const ctx = await initWebGPU();
         console.log('[WebGPU] 初始化成功');
 
@@ -564,6 +780,30 @@ async function initializeWebGPUView(): Promise<void> {
 
         // 启动渲染循环
         webgpuRenderer.startRenderLoop();
+
+        annotationRuntime = createAnnotationRuntime(
+            ctx,
+            updateAnnotationStatus,
+            emitViewSyncToEventBus
+        );
+        syncAnnotationControlsToEngine();
+        syncEngineSliceBoundsFromViews();
+
+        const canvas = webgpuRenderer.getCanvasElement();
+        if (canvas) {
+            annotationController = new AnnotationInteractionController(canvas, annotationRuntime.engine, {
+                viewType: 'axial',
+                requireCtrlKey: true,
+            });
+            annotationController.attach();
+        }
+
+        updateAnnotationStatus({
+            phase: 'idle',
+            roiId: annotationRuntime.engine.getActiveROI(),
+            pendingDirtyBricks: 0,
+            message: 'ready',
+        });
 
         console.log('[WebGPU] 测试立方体已加载');
     } catch (err) {
@@ -591,6 +831,38 @@ let currentImageData: any = null;
 let currentWindowWidth = 400;
 let currentWindowCenter = 40;
 
+function syncEngineSliceBoundsFromViews(): void {
+    if (!annotationRuntime) return;
+
+    const axial = views.get('axial')?.getSliceCount() ?? 1;
+    const sagittal = views.get('sagittal')?.getSliceCount() ?? 1;
+    const coronal = views.get('coronal')?.getSliceCount() ?? 1;
+    annotationRuntime.engine.setSliceBounds({ axial, sagittal, coronal });
+}
+
+function setupEventBusIntegration(): void {
+    eventBus.on('slice:sync', (payload) => {
+        for (const target of payload.targets) {
+            const view = views.get(target.viewType);
+            view?.setSlice(target.sliceIndex, false);
+            view?.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase);
+        }
+
+        const status = payload.budgetHit
+            ? `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines} (budget hit)`
+            : `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines}`;
+        updateSliceSyncStatus(status);
+    });
+
+    eventBus.on('slice:change', ({ viewType, sliceIndex }) => {
+        updateSliceSyncStatus(`切片变化: ${viewType} -> ${sliceIndex + 1}`);
+    });
+
+    eventBus.on('volume:loaded', ({ metadata }) => {
+        updateSliceSyncStatus(`体数据已加载: ${metadata.dimensions.join('×')}`);
+    });
+}
+
 async function initializeApp(): Promise<void> {
     console.log('Medical Imaging Viewer - Initializing VTK.js...');
 
@@ -608,6 +880,9 @@ async function initializeApp(): Promise<void> {
     // 设置窗宽窗位控件
     setupWindowLevelControls();
 
+    // 绑定事件总线（里程碑 3：切面 + 同步）
+    setupEventBusIntegration();
+
     // 设置 ROI 绘制控件（WebGPU 勾画系统待接入）
     setupROIControls();
 
@@ -621,31 +896,31 @@ async function initializeApp(): Promise<void> {
 }
 
 function setupROIControls(): void {
-    // ROI 选择 — WebGPU 勾画系统待接入
     const roiSelect = document.getElementById('roi-select') as HTMLSelectElement;
     if (roiSelect) {
         roiSelect.addEventListener('change', () => {
-            const roiId = parseInt(roiSelect.value);
-            console.log(`ROI 切换为: ${roiId} (WebGPU annotation system not yet initialized)`);
+            syncAnnotationControlsToEngine();
+            const roiId = parseInt(roiSelect.value, 10);
+            console.log(`[Annotation] ROI 切换为 ${roiId}`);
         });
     }
 
-    // 笔刷大小 — WebGPU 勾画系统待接入
     const brushSizeInput = document.getElementById('brush-size') as HTMLInputElement;
     const brushSizeLabel = document.getElementById('brush-size-label');
     if (brushSizeInput && brushSizeLabel) {
         brushSizeInput.addEventListener('input', () => {
-            const size = parseInt(brushSizeInput.value);
+            const size = parseInt(brushSizeInput.value, 10);
             brushSizeLabel.textContent = String(size);
-            console.log(`笔刷大小: ${size} (WebGPU annotation system not yet initialized)`);
+            syncAnnotationControlsToEngine();
+            console.log(`[Annotation] 笔刷大小 ${size}`);
         });
     }
 
-    // 擦除模式 — WebGPU 勾画系统待接入
     const eraseModeInput = document.getElementById('erase-mode') as HTMLInputElement;
     if (eraseModeInput) {
         eraseModeInput.addEventListener('change', () => {
-            console.log(`擦除模式: ${eraseModeInput.checked ? '开启' : '关闭'} (WebGPU annotation system not yet initialized)`);
+            syncAnnotationControlsToEngine();
+            console.log(`[Annotation] 擦除模式 ${eraseModeInput.checked ? '开启' : '关闭'}`);
         });
     }
 }
@@ -693,6 +968,7 @@ async function loadTestDicomData(): Promise<void> {
             view.setImageData(currentImageData);
             view.setWindowLevel(currentWindowWidth, currentWindowCenter);
         }
+        syncEngineSliceBoundsFromViews();
 
         // 更新窗宽窗位输入框
         const wwInput = document.getElementById('window-width') as HTMLInputElement;
@@ -702,6 +978,23 @@ async function loadTestDicomData(): Promise<void> {
 
         // 更新信息
         const dims = currentImageData.getDimensions();
+        const spacing = currentImageData.getSpacing?.() ?? [1, 1, 1];
+        const origin = currentImageData.getOrigin?.() ?? [0, 0, 0];
+        eventBus.emit('volume:loaded', {
+            metadata: {
+                dimensions: [dims[0], dims[1], dims[2]],
+                spacing: [spacing[0], spacing[1], spacing[2]],
+                origin: [origin[0], origin[1], origin[2]],
+                direction: new Float64Array([
+                    1, 0, 0,
+                    0, 1, 0,
+                    0, 0, 1,
+                ]),
+                dataType: 'float32',
+                windowWidth: currentWindowWidth,
+                windowCenter: currentWindowCenter,
+            },
+        });
 
         const statsInfo = document.getElementById('stats-info');
         if (statsInfo) {
@@ -709,9 +1002,19 @@ async function loadTestDicomData(): Promise<void> {
                 <div>尺寸: ${dims[0]} × ${dims[1]} × ${dims[2]}</div>
                 <div>类型: ${useTestData ? '测试数据' : 'CT DICOM'}</div>
                 <div>来源: ${useTestData ? '程序生成' : 'dcmtest/Anonymized0706'}</div>
-                <div style="color: var(--accent);">WebGPU 勾画系统重构中...</div>
+                <div style="color: var(--accent);">WebGPU 里程碑3: 切面与同步已接入</div>
             `;
         }
+
+        if (annotationRuntime) {
+            updateAnnotationStatus({
+                phase: 'idle',
+                roiId: annotationRuntime.engine.getActiveROI(),
+                pendingDirtyBricks: 0,
+                message: 'ready',
+            });
+        }
+        updateSliceSyncStatus('切面同步: waiting');
 
         console.log('Test data loaded successfully');
     } catch (error) {
@@ -739,6 +1042,7 @@ function setupWindowLevelControls(): void {
             for (const view of views.values()) {
                 view.setWindowLevel(ww, wc);
             }
+            eventBus.emit('window:change', { windowWidth: ww, windowCenter: wc });
         });
     }
 
@@ -769,6 +1073,7 @@ function setupWindowLevelControls(): void {
             for (const view of views.values()) {
                 view.setWindowLevel(preset.ww, preset.wc);
             }
+            eventBus.emit('window:change', { windowWidth: preset.ww, windowCenter: preset.wc });
         });
         presetContainer.appendChild(btn);
     }
@@ -779,3 +1084,4 @@ function setupWindowLevelControls(): void {
 
 // 启动
 document.addEventListener('DOMContentLoaded', initializeApp);
+

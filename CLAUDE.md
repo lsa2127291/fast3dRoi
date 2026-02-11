@@ -1,10 +1,10 @@
 ﻿# CLAUDE.md
 
-本文件为 Claude Code（claude.ai/code）在本仓库中工作时提供指导。
+本文件为本仓库中工作时提供指导。
 
 ## 项目概览
 
-医学影像查看器（fast3dRoi），用于高精度 CT 可视化与 ROI 标注。支持 Axial/Sagittal/Coronal 三视图下的 MPR（多平面重建）、基于 2D 画笔的 ROI 绘制，以及通过 Marching Cubes 实现的实时 3D 表面渲染。项目基于 TypeScript、VTK.js 和 Vite。
+医学影像查看器（fast3dRoi），用于高精度 CT 可视化与 ROI 标注。支持 Axial/Sagittal/Coronal 三视图下的 MPR（多平面重建）。项目正在从 VTK.js/CPU 架构迁移到 WebGPU 原生架构，以实现高性能 ROI 勾画与 3D 表面渲染。
 
 ## 命令
 
@@ -16,36 +16,45 @@ npm run test         # 运行测试（Vitest + jsdom）
 npm run test:perf    # 性能测试（详细输出）
 ```
 
-## 架构
+## 当前架构
 
 ### 数据流
 
 ```
 DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
   -> VTK ImageData -> 3 个 MPR 视图（Axial/Sagittal/Coronal）
-  -> 用户绘制 ROI（Ctrl + 左键点击）-> BrushTool -> SparseROIManager
-  -> EventBus 'roi:update' -> MarchingCubesMeshGenerator -> VolumeView3D（VTK.js）
+  -> [WebGPU 勾画系统] -> 3D 渲染（#volume-view）
 ```
 
 ### 关键模块
 
-- **`src/main.ts`**（约 1,098 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、鼠标交互（Ctrl+点击=绘制，滚轮=切片，右键=窗宽窗位），并通过 `initializeApp()` 完成应用初始化。
+#### MPR 视图（VTK.js，保留）
 
-- **`src/annotation/SparseROIManager.ts`**：核心 ROI 存储模块，使用稀疏 64×64×64 块与 4 层位掩码编码（`Uint32Array`）。在 3000×3000×300 的虚拟空间中最多支持 100 个并行 ROI。CT 数据采用居中并保留边距。关键方法：`paintSphere()`、`paintCircle()`、`getSliceMasks()`。
-
-- **`src/mesh/MarchingCubesMeshGenerator.ts`**：基于 Marching Cubes 算法与查找表（`MarchingCubesLUT.ts`）从稀疏 ROI 数据生成 3D 三角网格。处理跨块边界体素访问。
-
-- **`src/views/VolumeView3D.ts`**：VTK.js 的 3D 渲染管线（RenderWindow -> Renderer -> OpenGL）。管理每个 ROI 对应的 Actor 与 PolyData mapper。支持 Trackball 相机交互。
-
-- **`src/core/EventBus.ts`**：用于视图间通信的单例事件系统。关键事件：`slice:change`、`window:change`、`roi:paint`、`roi:update`、`volume:loaded`。
-
-- **`src/core/types.ts`**：中心类型定义。关键类型：`VolumeData`、`VolumeMetadata`、`ROIMetadata`、`SparseBlock`、`Vec3`。常量：`BLOCK_SIZE=64`、`MAX_ROI_COUNT=100`、`MAX_GPU_BLOCKS=256`。
-
-- **`src/annotation/BrushTool.ts`**：2D 画笔工具，半径范围 1-50，支持擦除模式与笔画插值以实现平滑绘制。
-
-- **`src/views/ROICanvasOverlay.ts`**：用于在 2D MPR 视图上渲染 ROI 轮廓的 Canvas 覆盖层。使用 `ContourExtractor` 进行轮廓提取。
+- **`src/main.ts`**（约 600 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、鼠标交互（滚轮=切片，右键=窗宽窗位），并通过 `initializeApp()` 完成应用初始化。
 
 - **`src/loaders/`**：DICOM（基于 dcmjs）与 NIfTI 加载器，并统一抽象为 `VolumeData`。
+
+- **`src/core/EventBus.ts`**：用于视图间通信的单例事件系统。关键事件：`slice:change`、`window:change`、`volume:loaded`。
+
+- **`src/core/types.ts`**：中心类型定义。关键类型：`VolumeData`、`VolumeMetadata`、`Vec3`。
+
+#### WebGPU 勾画系统（新架构）
+
+- **`src/gpu/WebGPUContext.ts`**：WebGPU 设备管理器，Fail-Fast 初始化。硬依赖：`subgroups`、`shader-f16`。单例模式。
+
+- **`src/gpu/constants.ts`**：全局 GPU 常量。量化参数（0.1mm 精度）、资源池大小（VertexPool 1GB, IndexPool 1GB）、性能目标（30ms/60ms/300ms）。
+
+- **`src/gpu/data/VertexQ.ts`**：量化顶点格式（8B/vertex, Int16 编码）。编解码函数：`quantize()`, `packVertexQ()`, `decodeVertexQ()`。
+
+- **`src/gpu/data/ResourcePools.ts`**：GPU 缓冲池管理。`VertexPool` 和 `IndexPool`，逻辑分页，底层 512MB 大 Buffer。
+
+- **`src/gpu/data/ChunkTable.ts`**：Chunk 元数据表。脏砖管理、AABB 粗裁剪、版本号同步。
+
+- **`src/gpu/pipelines/BasicRenderPipeline.ts`**：WebGPU 渲染管线。BindGroup 管理、Uniform 更新、深度缓冲配置。
+
+- **`src/gpu/WebGPURenderer.ts`**：WebGPU 渲染器。Canvas 管理、轨迹球相机、网格上传、渲染循环。
+
+- **`src/gpu/shaders/*.wgsl`**：WGSL 着色器。`basic_render.wgsl`（顶点+片段）、`structs.wgsl`（数据结构）、`vertexq_utils.wgsl`（工具函数）。
 
 ### 路径别名
 
@@ -53,9 +62,10 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 
 ## 关键依赖
 
-- **@kitware/vtk.js**：3D/2D 渲染引擎（基于 OpenGL）
+- **@kitware/vtk.js**：MPR 视图渲染引擎（基于 WebGL）
 - **dcmjs**：DICOM 文件解析
 - **nifti-reader-js**：NIfTI 格式支持
+- **@webgpu/types**：WebGPU TypeScript 类型定义（devDependency）
 
 ## 测试数据
 
@@ -63,11 +73,40 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 
 ## 开发状态
 
-第 1-5 阶段已完成（MPR 视图、加载器、ROI 标注、3D 网格）。第 6 阶段（性能优化：增量网格更新、内存管理、LOD）进行中。第 7 阶段（集成测试、基准测试）待开展。完整清单见 `doc/task.md`，第 6 阶段详情见 `doc/implementation_plan.md`。
+**当前分支**: `feature/webgpu-annotation`
+
+**里程碑 1** ✅ 已完成（Phase 0-5）：WebGPU 基础渲染管线
+- WebGPU 初始化 + 能力检测
+- VertexQ 量化数据模型
+- 基础渲染管线（WGSL shader + 测试立方体）
+- 详见：`doc/archive/webgpu-phase0-5-completion.md`
+
+**里程碑 2** 🚧 待开展（Phase 6-8）：GPU 勾画核心
+- SDF Bricks 存储
+- GPU Marching Cubes
+- 交互编辑管线
+
+**里程碑 3** 📋 待开展（Phase 9-10）：MPR 切面 + 同步
+
+**里程碑 4** 📋 待开展（Phase 11-13）：完善与优化
+
+完整任务清单见 `doc/task.md`。
+
+## 架构文档
+
+- **`doc/仿 RayStation 勾画架构文档 2.4.md`**：WebGPU 架构设计文档（367 行）。定义了 Fail-Fast 初始化、VertexQ 量化、SDF Bricks、Subgroup 主路径、性能目标等核心设计。
+
+## 归档文档
+
+- **`doc/archive/vtk-task.md`**：旧 VTK.js 架构的任务清单（阶段 1-7）
+- **`doc/archive/vtk-phase6-implementation_plan.md`**：旧 VTK.js 阶段 6 性能优化计划
+- **`doc/archive/vtk-phase5-walkthrough.md`**：旧 VTK.js 阶段 5 完成说明
+- **`doc/archive/webgpu-phase0-5-completion.md`**：WebGPU 里程碑 1 完成归档
 
 ## 备注
 
 - UI 标签为中文
-- 需要 WebGL 2.0 支持（建议 Chrome 136+）
+- MPR 视图需要 WebGL 2.0 支持
+- WebGPU 勾画系统需要 Chrome 136+ 并支持 `subgroups` 和 `shader-f16`
 - 已启用 TypeScript 严格模式；不允许未使用的局部变量/参数
-- `doc/从 RayStation 勾画架构文档 2.4.md` 描述了未来的 WebGPU 架构路径（尚未实现）
+- 当前 WebGPU 系统仅渲染测试立方体，尚未接入实际 ROI 勾画交互
