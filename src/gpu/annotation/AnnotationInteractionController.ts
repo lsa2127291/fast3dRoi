@@ -2,6 +2,8 @@ import { WORKSPACE_SIZE_MM } from '../constants';
 import type { AnnotationEngine } from './AnnotationEngine';
 import type { MPRViewType, Vec3MM } from './types';
 
+type PointerLikeEvent = MouseEvent | PointerEvent;
+
 export interface AnnotationStrokeLifecycleEvent {
     viewType: MPRViewType;
 }
@@ -18,7 +20,7 @@ export interface AnnotationInteractionControllerOptions {
     triggerButton?: 0 | 1 | 2;
     suppressContextMenu?: boolean;
     captureEvents?: boolean;
-    screenToWorld?: (event: MouseEvent, viewType: MPRViewType, targetElement: HTMLElement) => Vec3MM;
+    screenToWorld?: (event: PointerLikeEvent, viewType: MPRViewType, targetElement: HTMLElement) => Vec3MM;
     onStrokeStart?: (event: AnnotationStrokeLifecycleEvent) => void;
     onStrokeSample?: (event: AnnotationStrokeSampleEvent) => void;
     onStrokeEnd?: (event: AnnotationStrokeLifecycleEvent) => void;
@@ -30,8 +32,9 @@ export class AnnotationInteractionController {
     private readonly triggerButton: 0 | 1 | 2;
     private readonly suppressContextMenu: boolean;
     private readonly captureEvents: boolean;
+    private readonly usePointerEvents: boolean;
     private readonly customScreenToWorld?: (
-        event: MouseEvent,
+        event: PointerLikeEvent,
         viewType: MPRViewType,
         targetElement: HTMLElement
     ) => Vec3MM;
@@ -42,6 +45,39 @@ export class AnnotationInteractionController {
     private lastStrokeSampleWorld: Vec3MM | null = null;
 
     private readonly onMouseDown = (event: MouseEvent): void => {
+        this.beginStroke(event);
+    };
+
+    private readonly onMouseMove = (event: MouseEvent): void => {
+        this.updateStroke(event);
+    };
+
+    private readonly onMouseUp = (event: MouseEvent): void => {
+        this.endStroke(event);
+    };
+
+    private readonly onPointerDown = (event: PointerEvent): void => {
+        if (event.pointerType !== 'mouse') {
+            return;
+        }
+        this.beginStroke(event);
+    };
+
+    private readonly onPointerMove = (event: PointerEvent): void => {
+        if (event.pointerType !== 'mouse') {
+            return;
+        }
+        this.updateStroke(event);
+    };
+
+    private readonly onPointerUp = (event: PointerEvent): void => {
+        if (event.pointerType !== 'mouse') {
+            return;
+        }
+        this.endStroke(event);
+    };
+
+    private beginStroke(event: PointerLikeEvent): void {
         if (event.button !== this.triggerButton) {
             return;
         }
@@ -50,15 +86,16 @@ export class AnnotationInteractionController {
         }
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation();
         this.isDrawing = true;
         this.onStrokeStart?.({ viewType: this.viewType });
         const world = this.screenToWorld(event);
         this.lastStrokeSampleWorld = [...world] as Vec3MM;
         void this.engine.previewStroke(world, this.viewType);
         this.emitStrokeSample(world);
-    };
+    }
 
-    private readonly onMouseMove = (event: MouseEvent): void => {
+    private updateStroke(event: PointerLikeEvent): void {
         if (!this.isDrawing) {
             return;
         }
@@ -67,13 +104,14 @@ export class AnnotationInteractionController {
         }
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation();
         const world = this.screenToWorld(event);
         this.lastStrokeSampleWorld = [...world] as Vec3MM;
         void this.engine.previewStroke(world, this.viewType);
         this.emitStrokeSample(world);
-    };
+    }
 
-    private readonly onMouseUp = (event: MouseEvent): void => {
+    private endStroke(event: PointerLikeEvent): void {
         if (!this.isDrawing) {
             return;
         }
@@ -82,6 +120,7 @@ export class AnnotationInteractionController {
         }
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation();
         const world = this.lastStrokeSampleWorld
             ? [...this.lastStrokeSampleWorld] as Vec3MM
             : this.screenToWorld(event);
@@ -89,7 +128,7 @@ export class AnnotationInteractionController {
         this.lastStrokeSampleWorld = null;
         this.onStrokeEnd?.({ viewType: this.viewType });
         void this.engine.commitStroke(world, this.viewType);
-    };
+    }
 
     private readonly onContextMenu = (event: MouseEvent): void => {
         if (this.suppressContextMenu) {
@@ -107,6 +146,7 @@ export class AnnotationInteractionController {
         this.triggerButton = options.triggerButton ?? 2;
         this.suppressContextMenu = options.suppressContextMenu ?? true;
         this.captureEvents = options.captureEvents ?? true;
+        this.usePointerEvents = typeof window !== 'undefined' && typeof window.PointerEvent !== 'undefined';
         this.customScreenToWorld = options.screenToWorld;
         this.onStrokeStart = options.onStrokeStart;
         this.onStrokeSample = options.onStrokeSample;
@@ -114,22 +154,34 @@ export class AnnotationInteractionController {
     }
 
     attach(): void {
+        this.targetElement.addEventListener('contextmenu', this.onContextMenu, { capture: this.captureEvents });
+        if (this.usePointerEvents) {
+            this.targetElement.addEventListener('pointerdown', this.onPointerDown, { capture: this.captureEvents });
+            this.targetElement.addEventListener('pointermove', this.onPointerMove, { capture: this.captureEvents });
+            window.addEventListener('pointerup', this.onPointerUp);
+            return;
+        }
         this.targetElement.addEventListener('mousedown', this.onMouseDown, { capture: this.captureEvents });
         this.targetElement.addEventListener('mousemove', this.onMouseMove, { capture: this.captureEvents });
-        this.targetElement.addEventListener('contextmenu', this.onContextMenu, { capture: this.captureEvents });
         window.addEventListener('mouseup', this.onMouseUp);
     }
 
     detach(): void {
-        this.targetElement.removeEventListener('mousedown', this.onMouseDown, { capture: this.captureEvents });
-        this.targetElement.removeEventListener('mousemove', this.onMouseMove, { capture: this.captureEvents });
         this.targetElement.removeEventListener('contextmenu', this.onContextMenu, { capture: this.captureEvents });
-        window.removeEventListener('mouseup', this.onMouseUp);
+        if (this.usePointerEvents) {
+            this.targetElement.removeEventListener('pointerdown', this.onPointerDown, { capture: this.captureEvents });
+            this.targetElement.removeEventListener('pointermove', this.onPointerMove, { capture: this.captureEvents });
+            window.removeEventListener('pointerup', this.onPointerUp);
+        } else {
+            this.targetElement.removeEventListener('mousedown', this.onMouseDown, { capture: this.captureEvents });
+            this.targetElement.removeEventListener('mousemove', this.onMouseMove, { capture: this.captureEvents });
+            window.removeEventListener('mouseup', this.onMouseUp);
+        }
         this.isDrawing = false;
         this.lastStrokeSampleWorld = null;
     }
 
-    private screenToWorld(event: MouseEvent): Vec3MM {
+    private screenToWorld(event: PointerLikeEvent): Vec3MM {
         if (this.customScreenToWorld) {
             return this.customScreenToWorld(event, this.viewType, this.targetElement);
         }
@@ -167,7 +219,7 @@ export class AnnotationInteractionController {
         });
     }
 
-    private isEventInsideTarget(event: MouseEvent): boolean {
+    private isEventInsideTarget(event: PointerLikeEvent): boolean {
         const rect = this.targetElement.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) {
             return true;

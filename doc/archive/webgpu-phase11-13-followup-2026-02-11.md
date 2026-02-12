@@ -140,3 +140,23 @@
 **归档日期**: 2026-02-11  
 **归档人**: Codex
 
+---
+
+## 2026-02-12 补充归档：勾画同步不触发 CT 翻页
+
+**需求日期**: 2026-02-12  
+**需求**: 勾画同步时不允许 Axial/Sagittal/Coronal 视图自动翻页。  
+
+### 改动说明
+
+- 移除 `slice:sync` 监听中对 `view.setSlice(target.sliceIndex, false)` 的调用。
+- 保留跨视图 overlay 同步，但兜底点仅写入各视图当前切片，确保同步行为不改变用户当前浏览层。
+
+涉及文件：
+
+- `src/main.ts`
+- `AGENTS.md`
+
+### 行为约束（新增）
+
+- `slice:sync` 只同步 overlay 数据，不驱动 CT 视图切片跳转。

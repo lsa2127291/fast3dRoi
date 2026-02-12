@@ -30,7 +30,7 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 
 #### MPR 视图（VTK.js，保留）
 
-- **`src/main.ts`**（约 1800 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、overlay 渲染与勾画交互桥接（右键勾画），并通过 `initializeApp()` 完成应用初始化。
+- **`src/main.ts`**（约 1800 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、overlay 渲染与勾画交互桥接（左键勾画、右键缩放），并通过 `initializeApp()` 完成应用初始化。
 
 - **`src/loaders/`**：DICOM（基于 dcmjs）与 NIfTI 加载器，并统一抽象为 `VolumeData`。
 
@@ -128,3 +128,4 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - WebGPU 勾画系统需要 Chrome 136+ 并支持 `subgroups` 和 `shader-f16`
 - 已启用 TypeScript 严格模式；不允许未使用的局部变量/参数
 - 当前 2D ROI 勾画 overlay 已接入并运行在 GPU 管线；3D 体渲染侧仍保留测试立方体基线
+- 勾画同步约束：`slice:sync` 只能同步 overlay，不得触发 Axial/Sagittal/Coronal 视图自动翻页

@@ -14,7 +14,9 @@ import vtkRenderWindowInteractor from '@kitware/vtk.js/Rendering/Core/RenderWind
 import vtkImageMapper from '@kitware/vtk.js/Rendering/Core/ImageMapper';
 import vtkImageSlice from '@kitware/vtk.js/Rendering/Core/ImageSlice';
 import vtkOpenGLRenderWindow from '@kitware/vtk.js/Rendering/OpenGL/RenderWindow';
-import vtkInteractorStyleImage from '@kitware/vtk.js/Interaction/Style/InteractorStyleImage';
+import vtkInteractorStyleManipulator from '@kitware/vtk.js/Interaction/Style/InteractorStyleManipulator';
+import vtkMouseCameraTrackballPanManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballPanManipulator';
+import vtkMouseCameraTrackballZoomManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballZoomManipulator';
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 
@@ -42,13 +44,10 @@ import type {
 } from './gpu/annotation/AnnotationInteractionController';
 import { packVertexQ } from './gpu/data/VertexQ';
 import type { VertexQEncoded } from './gpu/data/VertexQ';
-import { QUANT_STEP_MM, WORKSPACE_SIZE_MM } from './gpu/constants';
-import {
-    computeCircularOverlayPixelRadii,
-    projectOverlayCircle,
-} from './gpu/annotation/SliceOverlayProjector';
+import { QUANT_STEP_MM } from './gpu/constants';
 import { SliceOverlayAccumulator } from './gpu/annotation/SliceOverlayAccumulator';
 import { GPUSliceOverlayRenderer } from './gpu/annotation/GPUSliceOverlayRenderer';
+import { projectStrokeByPlaneIntersection } from './gpu/annotation/StrokePlaneIntersectionProjector';
 import { eventBus } from './core/EventBus';
 
 // dcmjs 全局变量（通过 CDN 加载）
@@ -85,8 +84,6 @@ class VTKMPRView {
     private windowCenter = 40;
     private dimensions: number[] = [1, 1, 1];
     private imageSpacing: number[] = [1, 1, 1];
-    private initialParallelScale = 1;
-    private initialFocalPoint: [number, number, number] = [0, 0, 0];
     private overlayGPUCanvas: HTMLCanvasElement | null = null;
     private overlayGPURenderer: GPUSliceOverlayRenderer | null = null;
     private readonly overlayAccumulator = new SliceOverlayAccumulator();
@@ -117,44 +114,32 @@ class VTKMPRView {
         // 创建交互器
         this.interactor = vtkRenderWindowInteractor.newInstance();
         this.interactor.setView(this.openGLRenderWindow);
-        const style = vtkInteractorStyleImage.newInstance();
+
+        // 使用 Manipulator 风格的显式映射，避免覆写冻结对象方法导致的绑定失效
+        const style = vtkInteractorStyleManipulator.newInstance();
+        const rightZoomManipulator = vtkMouseCameraTrackballZoomManipulator.newInstance({
+            button: 3,
+            shift: false,
+            control: false,
+            alt: false,
+        });
+        const middlePanManipulator = vtkMouseCameraTrackballPanManipulator.newInstance({
+            button: 2,
+            shift: false,
+            control: false,
+            alt: false,
+        });
+        style.addMouseManipulator(rightZoomManipulator);
+        style.addMouseManipulator(middlePanManipulator);
         this.interactor.setInteractorStyle(style);
 
-        // 修改交互按键绑定 (通过覆盖实例方法实现)
-        // 当前交互: 左键=勾画(由 AnnotationInteractionController 捕获), 右键=Zoom, 中键=Pan
-        // 注意: vtkInteractorStyleImage 默认: 左键=WL, 右键=Zoom, 中键=Pan
-
-        try {
-            // 尝试覆盖实例方法
-            // 注意：某些 VTK.js 对象可能是冻结的，导致赋值失败
-
-            // 1. 左键: Pan (原默认是 WL)
-            (style as any).handleLeftButtonPress = (_callData: any) => {
-                style.startPan();
-            };
-            (style as any).handleLeftButtonRelease = () => {
-                style.endPan();
-            };
-
-            // 2. 右键: Zoom (保持默认为 dolly)
-            (style as any).handleRightButtonPress = (_callData: any) => {
-                style.startDolly();
-            };
-            (style as any).handleRightButtonRelease = () => {
-                style.endDolly();
-            };
-
-            // 3. 中键: Pan
-            (style as any).handleMiddleButtonPress = (_callData: any) => {
-                style.startPan();
-            };
-            (style as any).handleMiddleButtonRelease = () => {
-                style.endPan();
-            };
-        } catch (e) {
-            console.warn('Failed to rebind keys on vtkInteractorStyleImage:', e);
-            // 降级回默认行为，保证应用不崩
-        }
+        // 相机交互(缩放/平移)期间同步刷新 overlay，使用 full 质量避免视觉抖动
+        (style as any).onInteractionEvent?.(() => {
+            this.paintOverlay('full');
+        });
+        (style as any).onEndInteractionEvent?.(() => {
+            this.paintOverlay('full');
+        });
 
         this.interactor.bindEvents(this.container);
         this.interactor.initialize();
@@ -292,37 +277,185 @@ class VTKMPRView {
         this.overlayRenderedCameraKey = '';
     }
 
+    private getAxisSpanMM(axis: 0 | 1 | 2): number {
+        const dimension = Math.max(1, this.dimensions[axis] ?? 1);
+        const spacing = Math.max(1e-6, this.imageSpacing[axis] ?? 1);
+        return Math.max(1e-6, (dimension - 1) * spacing);
+    }
+
+    private sliceIndexToDatasetAxisMM(sliceIndex: number, sliceCount: number, axisSpanMM: number): number {
+        if (sliceCount <= 1) {
+            return axisSpanMM * 0.5;
+        }
+        const clampedIndex = Math.max(0, Math.min(sliceCount - 1, Math.round(sliceIndex)));
+        const normalized = clampedIndex / (sliceCount - 1);
+        return normalized * axisSpanMM;
+    }
+
+    private getSliceAxisForViewType(viewType: ViewType = this.viewType): 0 | 1 | 2 {
+        switch (viewType) {
+            case 'axial':
+                return 2;
+            case 'sagittal':
+                return 0;
+            case 'coronal':
+                return 1;
+        }
+    }
+
+    private getSliceCountForAxis(axis: 0 | 1 | 2): number {
+        return Math.max(1, this.dimensions[axis] ?? 1);
+    }
+
+    private annotationToDatasetWorld(centerMM: [number, number, number]): [number, number, number] {
+        const spanXMM = this.getAxisSpanMM(0);
+        const spanYMM = this.getAxisSpanMM(1);
+        const spanZMM = this.getAxisSpanMM(2);
+        return [
+            centerMM[0] + spanXMM * 0.5,
+            centerMM[1] + spanYMM * 0.5,
+            centerMM[2] + spanZMM * 0.5,
+        ];
+    }
+
+    private datasetToAnnotationWorld(centerMM: [number, number, number]): [number, number, number] {
+        const spanXMM = this.getAxisSpanMM(0);
+        const spanYMM = this.getAxisSpanMM(1);
+        const spanZMM = this.getAxisSpanMM(2);
+        return [
+            centerMM[0] - spanXMM * 0.5,
+            centerMM[1] - spanYMM * 0.5,
+            centerMM[2] - spanZMM * 0.5,
+        ];
+    }
+
+    private getCurrentSliceDatasetAxisMM(): { axis: 0 | 1 | 2; valueMM: number } {
+        const axis = this.getSliceAxisForViewType();
+        const axisSpanMM = this.getAxisSpanMM(axis);
+        const sliceCount = this.getSliceCountForAxis(axis);
+        const valueMM = this.sliceIndexToDatasetAxisMM(this.getSlice(), sliceCount, axisSpanMM);
+        return { axis, valueMM };
+    }
+
+    private intersectDisplayRayWithCurrentSlicePlane(
+        displayX: number,
+        displayY: number
+    ): [number, number, number] | null {
+        if (!this.openGLRenderWindow || !this.renderer) {
+            return null;
+        }
+        const near = this.openGLRenderWindow.displayToWorld(displayX, displayY, 0, this.renderer);
+        const far = this.openGLRenderWindow.displayToWorld(displayX, displayY, 1, this.renderer);
+        if (!near || !far) {
+            return null;
+        }
+
+        const { axis, valueMM } = this.getCurrentSliceDatasetAxisMM();
+        const denom = far[axis] - near[axis];
+        let t = Math.abs(denom) > 1e-6 ? (valueMM - near[axis]) / denom : 0;
+        if (!Number.isFinite(t)) {
+            t = 0;
+        }
+        const clampedT = Math.min(1, Math.max(0, t));
+        const point: [number, number, number] = [
+            near[0] + (far[0] - near[0]) * clampedT,
+            near[1] + (far[1] - near[1]) * clampedT,
+            near[2] + (far[2] - near[2]) * clampedT,
+        ];
+        point[axis] = valueMM;
+        return point;
+    }
+
+    private getOverlayCameraKey(rect: DOMRect): string {
+        const camera = this.renderer?.getActiveCamera();
+        if (!camera) {
+            return `${rect.width}:${rect.height}:no-camera`;
+        }
+        const parallelScale = camera.getParallelScale();
+        const focalPoint = camera.getFocalPoint();
+        const position = camera.getPosition();
+        const viewUp = camera.getViewUp();
+        return [
+            rect.width,
+            rect.height,
+            parallelScale.toFixed(6),
+            focalPoint.map((value: number) => value.toFixed(6)).join(','),
+            position.map((value: number) => value.toFixed(6)).join(','),
+            viewUp.map((value: number) => value.toFixed(6)).join(','),
+        ].join('|');
+    }
+
+    screenToAnnotationWorld(event: { clientX: number; clientY: number }): [number, number, number] {
+        const rect = this.container.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return [0, 0, 0];
+        }
+
+        const viewX = event.clientX - rect.left;
+        const viewY = event.clientY - rect.top;
+        const displayX = Math.min(rect.width, Math.max(0, viewX));
+        const displayY = Math.min(rect.height, Math.max(0, rect.height - viewY));
+        const intersectedPoint = this.intersectDisplayRayWithCurrentSlicePlane(displayX, displayY);
+        if (!intersectedPoint) {
+            return [0, 0, 0];
+        }
+        return this.datasetToAnnotationWorld(intersectedPoint);
+    }
+
     private projectOverlayOpsToPixels(
         ops: Array<{
             centerMM: [number, number, number];
             radiusMM: number;
             erase: boolean;
         }>,
-        rect: DOMRect,
-        zoomRatio: number,
-        panOffsetX: number,
-        panOffsetY: number
+        rect: DOMRect
     ): OverlayProjectedCircle[] {
-        const projectedOps: OverlayProjectedCircle[] = [];
-        for (const op of ops) {
-            const projected = projectOverlayCircle({
-                viewType: this.viewType,
-                centerMM: op.centerMM,
-                radiusMM: op.radiusMM,
-                workspaceSizeMM: WORKSPACE_SIZE_MM,
-            });
-            const radii = computeCircularOverlayPixelRadii({
-                radiusNorm: Math.max(projected.rx, projected.ry),
-                viewportWidth: rect.width,
-                viewportHeight: rect.height,
-                minRadiusPx: 2,
-            });
+        if (!this.openGLRenderWindow || !this.renderer) {
+            return [];
+        }
 
-            const baseCx = projected.cx * rect.width;
-            const baseCy = projected.cy * rect.height;
-            const cx = (baseCx - rect.width / 2) * zoomRatio + rect.width / 2 + panOffsetX;
-            const cy = (baseCy - rect.height / 2) * zoomRatio + rect.height / 2 + panOffsetY;
-            const radiusPx = Math.max(1, Math.max(radii.rxPx, radii.ryPx) * zoomRatio);
+        const projectedOps: OverlayProjectedCircle[] = [];
+        const radiusAxis: 0 | 1 | 2 = (() => {
+            switch (this.viewType) {
+                case 'axial':
+                    return 0;
+                case 'sagittal':
+                    return 1;
+                case 'coronal':
+                    return 0;
+            }
+        })();
+
+        for (const op of ops) {
+            const centerWorld = this.annotationToDatasetWorld(op.centerMM);
+            const edgeWorld: [number, number, number] = [...centerWorld] as [number, number, number];
+            edgeWorld[radiusAxis] += op.radiusMM;
+
+            const centerDisplay = this.openGLRenderWindow.worldToDisplay(
+                centerWorld[0],
+                centerWorld[1],
+                centerWorld[2],
+                this.renderer
+            );
+            const edgeDisplay = this.openGLRenderWindow.worldToDisplay(
+                edgeWorld[0],
+                edgeWorld[1],
+                edgeWorld[2],
+                this.renderer
+            );
+
+            if (!centerDisplay || !edgeDisplay) {
+                continue;
+            }
+
+            const cx = centerDisplay[0];
+            const cy = rect.height - centerDisplay[1];
+            const edgeX = edgeDisplay[0];
+            const edgeY = rect.height - edgeDisplay[1];
+            const radiusPx = Math.max(1, Math.hypot(edgeX - cx, edgeY - cy));
+            if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(radiusPx)) {
+                continue;
+            }
             projectedOps.push({
                 centerPx: [cx, cy],
                 radiusPx,
@@ -378,41 +511,14 @@ class VTKMPRView {
             return;
         }
 
-        // 计算缩放/平移补偿：让 overlay 跟随 VTK.js 相机变化
-        const camera = this.renderer?.getActiveCamera();
-        let zoomRatio = 1;
-        let panOffsetX = 0;
-        let panOffsetY = 0;
-        if (camera && this.initialParallelScale > 0) {
-            const currentScale = camera.getParallelScale();
-            zoomRatio = this.initialParallelScale / currentScale;
-
-            const fp = camera.getFocalPoint();
-            const pxPerMM = Math.min(rect.width, rect.height) / (2 * this.initialParallelScale);
-            switch (this.viewType) {
-                case 'axial':
-                    panOffsetX = -(fp[0] - this.initialFocalPoint[0]) * pxPerMM * zoomRatio;
-                    panOffsetY = (fp[1] - this.initialFocalPoint[1]) * pxPerMM * zoomRatio;
-                    break;
-                case 'sagittal':
-                    panOffsetX = -(fp[1] - this.initialFocalPoint[1]) * pxPerMM * zoomRatio;
-                    panOffsetY = -(fp[2] - this.initialFocalPoint[2]) * pxPerMM * zoomRatio;
-                    break;
-                case 'coronal':
-                    panOffsetX = -(fp[0] - this.initialFocalPoint[0]) * pxPerMM * zoomRatio;
-                    panOffsetY = -(fp[2] - this.initialFocalPoint[2]) * pxPerMM * zoomRatio;
-                    break;
-            }
-        }
-
-        const cameraKey = `${zoomRatio.toFixed(5)}:${panOffsetX.toFixed(2)}:${panOffsetY.toFixed(2)}:${rect.width.toFixed(1)}:${rect.height.toFixed(1)}`;
+        const cameraKey = this.getOverlayCameraKey(rect);
         const canIncrementalDraw =
             this.overlayRenderedSliceIndex === sliceIndex
             && this.overlayRenderedCameraKey === cameraKey
             && this.overlayRenderedOpCount >= 0
             && this.overlayRenderedOpCount <= ops.length;
         const startOperationIndex = canIncrementalDraw ? this.overlayRenderedOpCount : 0;
-        const projectedOps = this.projectOverlayOpsToPixels(ops, rect, zoomRatio, panOffsetX, panOffsetY);
+        const projectedOps = this.projectOverlayOpsToPixels(ops, rect);
 
         if (quality === 'fast') {
             const gpuRendered = this.tryPaintOverlayWithGPU(
@@ -510,10 +616,6 @@ class VTKMPRView {
         this.renderer.resetCamera();
         this.renderer.resetCameraClippingRange();
 
-        // 记录初始缩放和焦点，用于 overlay 补偿
-        this.initialParallelScale = camera.getParallelScale();
-        const fp = camera.getFocalPoint();
-        this.initialFocalPoint = [fp[0], fp[1], fp[2]];
     }
 
     setWindowLevel(ww: number, wc: number): void {
@@ -884,6 +986,7 @@ interface OverlayHistoryOperation {
 
 type OverlayHistoryEntry = OverlayHistoryOperation[];
 
+const overlayCommittedHistory: OverlayHistoryEntry[] = [];
 const overlayUndoHistory: OverlayHistoryEntry[] = [];
 const overlayRedoHistory: OverlayHistoryEntry[] = [];
 const pendingOverlayStrokeQueue: OverlayHistoryEntry[] = [];
@@ -1003,23 +1106,72 @@ function consumePendingOverlayStrokeForPayload(
     return pendingOverlayStrokeQueue.shift() ?? null;
 }
 
-function projectPendingStrokeToView(
+function extractSourceStroke(entry: OverlayHistoryEntry): OverlayHistoryEntry {
+    if (entry.length === 0) {
+        return [];
+    }
+    const sourceViewType = entry[0].viewType;
+    return entry
+        .filter((operation) => operation.viewType === sourceViewType)
+        .map(cloneOverlayOperation);
+}
+
+function computeAxisSpanMM(dimensions: number[], spacing: number[], axis: 0 | 1 | 2): number {
+    const dimension = Math.max(1, dimensions[axis] ?? 1);
+    const axisSpacing = Math.max(1e-6, spacing[axis] ?? 1);
+    return Math.max(1e-6, (dimension - 1) * axisSpacing);
+}
+
+function getViewSliceAxisSpanMM(view: VTKMPRView, viewType: ViewType): number {
+    const dimensions = view.getDimensions();
+    const spacing = view.getSpacing();
+    switch (viewType) {
+        case 'axial':
+            return computeAxisSpanMM(dimensions, spacing, 2);
+        case 'sagittal':
+            return computeAxisSpanMM(dimensions, spacing, 0);
+        case 'coronal':
+            return computeAxisSpanMM(dimensions, spacing, 1);
+    }
+}
+
+function projectStrokeToSpecificSlice(
     source: OverlayHistoryEntry,
     targetViewType: ViewType,
-    targetSliceIndex: number
+    targetSliceCount: number,
+    targetSliceIndex: number,
+    targetSliceSpanMM: number
 ): OverlayHistoryEntry {
-    const projected: OverlayHistoryEntry = [];
-    for (const operation of source) {
-        projected.push({
+    const clampedTargetSliceIndex = Math.max(0, Math.min(targetSliceCount - 1, Math.floor(targetSliceIndex)));
+    const sourceViewType = source[0]?.viewType;
+    if (sourceViewType === targetViewType) {
+        const sameSliceOps = source.filter((operation) => operation.sliceIndex === clampedTargetSliceIndex);
+        return sameSliceOps.map((operation) => ({
             viewType: targetViewType,
-            sliceIndex: targetSliceIndex,
+            sliceIndex: clampedTargetSliceIndex,
             centerMM: [...operation.centerMM] as [number, number, number],
             radiusMM: operation.radiusMM,
             erase: operation.erase,
             strokeStart: operation.strokeStart,
-        });
+        }));
     }
-    return projected;
+
+    const projected = projectStrokeByPlaneIntersection({
+        source,
+        targetViewType,
+        targetSliceCount,
+        targetSliceIndex: clampedTargetSliceIndex,
+        targetSliceSpanMM,
+    });
+
+    return projected.map((operation) => ({
+        viewType: targetViewType,
+        sliceIndex: operation.sliceIndex,
+        centerMM: [...operation.centerMM] as [number, number, number],
+        radiusMM: operation.radiusMM,
+        erase: operation.erase,
+        strokeStart: operation.strokeStart,
+    }));
 }
 
 function clearAllAnnotationOverlays(): void {
@@ -1028,19 +1180,138 @@ function clearAllAnnotationOverlays(): void {
     }
 }
 
-function replayOverlayHistory(): void {
-    clearAllAnnotationOverlays();
-    for (const entry of overlayUndoHistory) {
-        for (const op of entry) {
-            const view = views.get(op.viewType);
-            if (!view) {
-                continue;
-            }
-            view.renderAnnotationOverlay(op.centerMM, op.radiusMM, op.erase, op.sliceIndex, op.strokeStart);
+function renderOverlayHistoryEntry(entry: OverlayHistoryEntry): void {
+    const sourceStroke = extractSourceStroke(entry);
+    if (sourceStroke.length === 0) {
+        return;
+    }
+    for (const [viewType, view] of views) {
+        const projected = projectStrokeToSpecificSlice(
+            sourceStroke,
+            viewType,
+            view.getSliceCount(),
+            view.getSlice(),
+            getViewSliceAxisSpanMM(view, viewType)
+        );
+        if (projected.length === 0) {
+            continue;
         }
+        view.renderAnnotationOverlayBatch(projected);
     }
 }
 
+function replayOverlayHistory(): void {
+    clearAllAnnotationOverlays();
+    for (const entry of overlayCommittedHistory) {
+        renderOverlayHistoryEntry(entry);
+    }
+    for (const entry of overlayUndoHistory) {
+        renderOverlayHistoryEntry(entry);
+    }
+}
+
+function pushOverlayHistoryEntry(entry: OverlayHistoryEntry): void {
+    const sourceStroke = extractSourceStroke(entry);
+    if (sourceStroke.length === 0) {
+        return;
+    }
+    overlayUndoHistory.push(sourceStroke);
+    overlayRedoHistory.length = 0;
+}
+
+function createFallbackSourceStrokeFromPayload(payload: {
+    centerMM: [number, number, number];
+    brushRadiusMM: number;
+    erase: boolean;
+    targets: Array<{ viewType: string }>;
+}): OverlayHistoryEntry {
+    const fallbackViewType = (payload.targets[0]?.viewType as ViewType | undefined) ?? 'axial';
+    const fallbackView = views.get(fallbackViewType);
+    const fallbackSliceIndex = fallbackView?.getSlice() ?? 0;
+    return [{
+        viewType: fallbackViewType,
+        sliceIndex: fallbackSliceIndex,
+        centerMM: [...payload.centerMM] as [number, number, number],
+        radiusMM: payload.brushRadiusMM,
+        erase: payload.erase,
+        strokeStart: true,
+    }];
+}
+
+function rebuildOverlayOnSliceChange(): void {
+    if (suppressOverlaySyncCapture) {
+        return;
+    }
+    if (overlayCommittedHistory.length === 0 && overlayUndoHistory.length === 0) {
+        return;
+    }
+    replayOverlayHistory();
+}
+
+function rebuildOverlayAfterCommit(
+    pendingSourceStroke: OverlayHistoryEntry | null,
+    payload: {
+        centerMM: [number, number, number];
+        brushRadiusMM: number;
+        erase: boolean;
+        targets: Array<{ viewType: string }>;
+    }
+): void {
+    if (suppressOverlaySyncCapture) {
+        return;
+    }
+
+    const historyEntry = pendingSourceStroke
+        ? pendingSourceStroke.map(cloneOverlayOperation)
+        : createFallbackSourceStrokeFromPayload(payload);
+    pushOverlayHistoryEntry(historyEntry);
+    trimOverlayHistoryToEngineDepth();
+    renderOverlayHistoryEntry(historyEntry);
+}
+
+function setupEventBusIntegration(): void {
+    eventBus.on('perf:page-flip', ({ viewType, durationMs, sliceIndex }) => {
+        recordPerformanceSample({
+            metric: 'page-flip',
+            durationMs,
+            timestamp: Date.now(),
+            viewType,
+        });
+        updateSliceSyncStatus(`切片变化: ${viewType} -> ${sliceIndex + 1} | flip ${durationMs.toFixed(1)}ms`);
+    });
+
+    eventBus.on('slice:change', () => {
+        rebuildOverlayOnSliceChange();
+    });
+
+    eventBus.on('slice:sync', (payload) => {
+        const pendingSourceStroke = suppressOverlaySyncCapture
+            ? null
+            : consumePendingOverlayStrokeForPayload(
+                [...payload.centerMM] as [number, number, number],
+                payload.brushRadiusMM,
+                payload.erase
+            );
+        rebuildOverlayAfterCommit(pendingSourceStroke, payload);
+
+        annotationPerformanceTracker.recordDiagnostics({
+            overflowCount: payload.overflow,
+            quantOverflowCount: payload.quantOverflow,
+            deferredLines: payload.totalDeferredLines,
+            budgetHit: payload.budgetHit,
+        });
+        updatePerformanceStatus();
+
+        const status = payload.budgetHit
+            ? `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines} (budget hit)`
+            : `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines}`;
+        updateSliceSyncStatus(status);
+    });
+
+    eventBus.on('volume:loaded', ({ metadata }) => {
+        updateSliceSyncStatus(`体数据已加载: ${metadata.dimensions.join('×')}`);
+    });
+}
 function trimOverlayHistoryToEngineDepth(): void {
     const snapshot = annotationRuntime?.engine.getHistorySnapshot();
     if (!snapshot) {
@@ -1048,7 +1319,9 @@ function trimOverlayHistoryToEngineDepth(): void {
     }
 
     if (overlayUndoHistory.length > snapshot.undoDepth) {
-        overlayUndoHistory.splice(0, overlayUndoHistory.length - snapshot.undoDepth);
+        const overflowCount = overlayUndoHistory.length - snapshot.undoDepth;
+        const committed = overlayUndoHistory.splice(0, overflowCount);
+        overlayCommittedHistory.push(...committed);
     }
     if (overlayRedoHistory.length > snapshot.redoDepth) {
         overlayRedoHistory.splice(0, overlayRedoHistory.length - snapshot.redoDepth);
@@ -1056,6 +1329,7 @@ function trimOverlayHistoryToEngineDepth(): void {
 }
 
 function resetOverlayHistory(): void {
+    overlayCommittedHistory.length = 0;
     overlayUndoHistory.length = 0;
     overlayRedoHistory.length = 0;
     pendingOverlayStrokeQueue.length = 0;
@@ -1262,9 +1536,9 @@ function syncAnnotationControlsToEngine(): void {
     }
 
     if (brushSizeInput) {
-        const size = parseInt(brushSizeInput.value, 10);
-        if (!Number.isNaN(size)) {
-            annotationRuntime.engine.setBrushRadius(size);
+        const radiusMM = parseFloat(brushSizeInput.value);
+        if (!Number.isNaN(radiusMM)) {
+            annotationRuntime.engine.setBrushRadius(radiusMM);
         }
     }
 
@@ -1364,13 +1638,15 @@ async function initializeWebGPUView(): Promise<void> {
         const controllerViewTypes: ViewType[] = ['axial', 'sagittal', 'coronal'];
         for (const viewType of controllerViewTypes) {
             const interactionTarget = interactionTargets[viewType];
-            if (!interactionTarget) {
+            const view = views.get(viewType);
+            if (!interactionTarget || !view) {
                 continue;
             }
             const controller = new AnnotationInteractionController(interactionTarget, annotationRuntime.engine, {
                 viewType,
                 requireCtrlKey: false,
                 triggerButton: 0,
+                screenToWorld: (event) => view.screenToAnnotationWorld(event),
                 onStrokeStart: beginLiveOverlayStroke,
                 onStrokeSample: appendLiveOverlayStrokeSample,
                 onStrokeEnd: finalizeLiveOverlayStroke,
@@ -1416,6 +1692,13 @@ let currentImageData: any = null;
 let currentWindowWidth = 400;
 let currentWindowCenter = 40;
 
+function formatBrushRadiusMM(radiusMM: number): string {
+    if (!Number.isFinite(radiusMM)) {
+        return '0';
+    }
+    return Number.isInteger(radiusMM) ? String(radiusMM) : radiusMM.toFixed(1);
+}
+
 function syncEngineSliceBoundsFromViews(): void {
     if (!annotationRuntime) return;
 
@@ -1423,86 +1706,6 @@ function syncEngineSliceBoundsFromViews(): void {
     const sagittal = views.get('sagittal')?.getSliceCount() ?? 1;
     const coronal = views.get('coronal')?.getSliceCount() ?? 1;
     annotationRuntime.engine.setSliceBounds({ axial, sagittal, coronal });
-}
-
-function setupEventBusIntegration(): void {
-    eventBus.on('perf:page-flip', ({ viewType, durationMs, sliceIndex }) => {
-        recordPerformanceSample({
-            metric: 'page-flip',
-            durationMs,
-            timestamp: Date.now(),
-            viewType,
-        });
-        updateSliceSyncStatus(`切片变化: ${viewType} -> ${sliceIndex + 1} | flip ${durationMs.toFixed(1)}ms`);
-    });
-
-    eventBus.on('slice:sync', (payload) => {
-        const overlayEntry: OverlayHistoryEntry = [];
-        const pendingSourceStroke = suppressOverlaySyncCapture
-            ? null
-            : consumePendingOverlayStrokeForPayload(
-                [...payload.centerMM] as [number, number, number],
-                payload.brushRadiusMM,
-                payload.erase
-            );
-        const pendingSourceViewType = pendingSourceStroke?.[0]?.viewType;
-        for (const target of payload.targets) {
-            const view = views.get(target.viewType);
-            if (!view) continue;
-
-            if (suppressOverlaySyncCapture) {
-                continue;
-            }
-
-            if (pendingSourceStroke) {
-                const targetSliceIndex = view.getSlice();
-                const projectedStroke = pendingSourceViewType === target.viewType
-                    ? pendingSourceStroke.map(cloneOverlayOperation)
-                    : projectPendingStrokeToView(
-                        pendingSourceStroke,
-                        target.viewType as ViewType,
-                        targetSliceIndex
-                    );
-
-                view.renderAnnotationOverlayBatch(projectedStroke);
-                overlayEntry.push(...projectedStroke);
-                continue;
-            }
-
-            const sliceIndex = view.getSlice();
-            // 不改变视图切片，在各视图的当前切片上渲染 overlay
-            view.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, sliceIndex, true);
-            overlayEntry.push({
-                viewType: target.viewType as ViewType,
-                sliceIndex,
-                centerMM: [...payload.centerMM] as [number, number, number],
-                radiusMM: payload.brushRadiusMM,
-                erase: payload.erase,
-                strokeStart: true,
-            });
-        }
-        if (!suppressOverlaySyncCapture && overlayEntry.length > 0) {
-            overlayUndoHistory.push(overlayEntry);
-            overlayRedoHistory.length = 0;
-        }
-
-        annotationPerformanceTracker.recordDiagnostics({
-            overflowCount: payload.overflow,
-            quantOverflowCount: payload.quantOverflow,
-            deferredLines: payload.totalDeferredLines,
-            budgetHit: payload.budgetHit,
-        });
-        updatePerformanceStatus();
-
-        const status = payload.budgetHit
-            ? `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines} (budget hit)`
-            : `切面同步: ROI ${payload.roiId} | lines ${payload.totalLineCount} | deferred ${payload.totalDeferredLines}`;
-        updateSliceSyncStatus(status);
-    });
-
-    eventBus.on('volume:loaded', ({ metadata }) => {
-        updateSliceSyncStatus(`体数据已加载: ${metadata.dimensions.join('×')}`);
-    });
 }
 
 async function initializeApp(): Promise<void> {
@@ -1550,11 +1753,13 @@ function setupROIControls(): void {
     const brushSizeInput = document.getElementById('brush-size') as HTMLInputElement;
     const brushSizeLabel = document.getElementById('brush-size-label');
     if (brushSizeInput && brushSizeLabel) {
+        const initialRadiusMM = parseFloat(brushSizeInput.value);
+        brushSizeLabel.textContent = formatBrushRadiusMM(initialRadiusMM);
         brushSizeInput.addEventListener('input', () => {
-            const size = parseInt(brushSizeInput.value, 10);
-            brushSizeLabel.textContent = String(size);
+            const radiusMM = parseFloat(brushSizeInput.value);
+            brushSizeLabel.textContent = formatBrushRadiusMM(radiusMM);
             syncAnnotationControlsToEngine();
-            console.log(`[Annotation] 笔刷大小 ${size}`);
+            console.log(`[Annotation] 笔刷半径 ${formatBrushRadiusMM(radiusMM)}mm`);
         });
     }
 
