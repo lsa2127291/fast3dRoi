@@ -11,6 +11,7 @@ import type {
     AnnotationPerformanceSample,
     AnnotationStatus,
     BrushStroke,
+    DirtyBrickKey,
     DirtyBrickEstimator,
     MPRSlicePipelineLike,
     MPRViewType,
@@ -79,7 +80,7 @@ export class AnnotationEngine {
     private readonly now: () => number;
     private readonly history: AnnotationHistoryEntry[] = [];
     private readonly redoStack: AnnotationHistoryEntry[] = [];
-    private readonly roiActiveDirtyBricks = new Map<number, Set<string>>();
+    private readonly roiActiveDirtyBricks = new Map<number, Map<DirtyBrickKey, number>>();
     private sliceBounds: ViewSyncTargetMap = {
         axial: 512,
         sagittal: 512,
@@ -134,6 +135,14 @@ export class AnnotationEngine {
         return this.activeROI;
     }
 
+    getBrushRadius(): number {
+        return this.brushRadiusMM;
+    }
+
+    getEraseMode(): boolean {
+        return this.eraseMode;
+    }
+
     canUndo(): boolean {
         return this.history.length > 0;
     }
@@ -158,8 +167,6 @@ export class AnnotationEngine {
     async previewStroke(centerMM: Vec3MM, viewType: MPRViewType): Promise<void> {
         const startedAt = this.now();
         const stroke = this.buildStroke(centerMM, viewType, 'preview', startedAt);
-        const dirtyBrickKeys = this.estimateDirtyBricks(stroke);
-        this.scheduler.enqueue(stroke.roiId, dirtyBrickKeys);
         await this.sdfPipeline.previewStroke(stroke);
 
         const endedAt = this.now();
@@ -175,7 +182,7 @@ export class AnnotationEngine {
             phase: 'preview',
             roiId: stroke.roiId,
             pendingDirtyBricks: this.scheduler.pendingCount(stroke.roiId),
-            message: `preview:${dirtyBrickKeys.length}`,
+            message: 'preview',
         });
     }
 
@@ -469,23 +476,29 @@ export class AnnotationEngine {
         dirtyBrickKeys: DirtyBrickKey[],
         erase: boolean
     ): DirtyBrickKey[] {
-        let active = this.roiActiveDirtyBricks.get(roiId);
-        if (!active) {
-            active = new Set<string>();
-            this.roiActiveDirtyBricks.set(roiId, active);
+        let activeCounts = this.roiActiveDirtyBricks.get(roiId);
+        if (!activeCounts) {
+            activeCounts = new Map<DirtyBrickKey, number>();
+            this.roiActiveDirtyBricks.set(roiId, activeCounts);
         }
 
         if (erase) {
             for (const key of dirtyBrickKeys) {
-                active.delete(key);
+                const count = activeCounts.get(key) ?? 0;
+                if (count <= 1) {
+                    activeCounts.delete(key);
+                } else {
+                    activeCounts.set(key, count - 1);
+                }
             }
         } else {
             for (const key of dirtyBrickKeys) {
-                active.add(key);
+                const count = activeCounts.get(key) ?? 0;
+                activeCounts.set(key, count + 1);
             }
         }
 
-        return Array.from(active);
+        return Array.from(activeCounts.keys());
     }
 
     private worldToSliceIndex(worldMM: number, sliceCount: number): number {

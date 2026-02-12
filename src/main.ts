@@ -36,6 +36,10 @@ import type {
     AnnotationStatus,
     ViewSyncEvent,
 } from './gpu/annotation';
+import type {
+    AnnotationStrokeLifecycleEvent,
+    AnnotationStrokeSampleEvent,
+} from './gpu/annotation/AnnotationInteractionController';
 import { packVertexQ } from './gpu/data/VertexQ';
 import type { VertexQEncoded } from './gpu/data/VertexQ';
 import { QUANT_STEP_MM, WORKSPACE_SIZE_MM } from './gpu/constants';
@@ -44,6 +48,7 @@ import {
     projectOverlayCircle,
 } from './gpu/annotation/SliceOverlayProjector';
 import { SliceOverlayAccumulator } from './gpu/annotation/SliceOverlayAccumulator';
+import { GPUSliceOverlayRenderer } from './gpu/annotation/GPUSliceOverlayRenderer';
 import { eventBus } from './core/EventBus';
 
 // dcmjs 全局变量（通过 CDN 加载）
@@ -58,6 +63,13 @@ declare const dcmjs: {
 };
 
 type ViewType = 'axial' | 'sagittal' | 'coronal';
+type OverlayRenderQuality = 'fast' | 'full';
+
+interface OverlayProjectedCircle {
+    centerPx: [number, number];
+    radiusPx: number;
+    erase: boolean;
+}
 
 // ========== MPR 视图类 ==========
 class VTKMPRView {
@@ -73,16 +85,14 @@ class VTKMPRView {
     private windowCenter = 40;
     private dimensions: number[] = [1, 1, 1];
     private imageSpacing: number[] = [1, 1, 1];
-    private isMiddleButtonDown = false;
     private initialParallelScale = 1;
     private initialFocalPoint: [number, number, number] = [0, 0, 0];
-    private overlayCanvas: HTMLCanvasElement | null = null;
-    private overlayContext: CanvasRenderingContext2D | null = null;
-    private overlayMaskCanvas: HTMLCanvasElement | null = null;
-    private overlayMaskContext: CanvasRenderingContext2D | null = null;
-    private overlayEdgeCanvas: HTMLCanvasElement | null = null;
-    private overlayEdgeContext: CanvasRenderingContext2D | null = null;
+    private overlayGPUCanvas: HTMLCanvasElement | null = null;
+    private overlayGPURenderer: GPUSliceOverlayRenderer | null = null;
     private readonly overlayAccumulator = new SliceOverlayAccumulator();
+    private overlayRenderedSliceIndex: number | null = null;
+    private overlayRenderedOpCount = 0;
+    private overlayRenderedCameraKey = '';
 
     constructor(container: HTMLElement, viewType: ViewType) {
         this.container = container;
@@ -111,7 +121,7 @@ class VTKMPRView {
         this.interactor.setInteractorStyle(style);
 
         // 修改交互按键绑定 (通过覆盖实例方法实现)
-        // 用户需求: 左键=Pan, 右键=W/L, 中键=Zoom
+        // 当前交互: 左键=勾画(由 AnnotationInteractionController 捕获), 右键=Zoom, 中键=Pan
         // 注意: vtkInteractorStyleImage 默认: 左键=WL, 右键=Zoom, 中键=Pan
 
         try {
@@ -126,20 +136,20 @@ class VTKMPRView {
                 style.endPan();
             };
 
-            // 2. 右键: Window/Level (原默认是 Zoom)
+            // 2. 右键: Zoom (保持默认为 dolly)
             (style as any).handleRightButtonPress = (_callData: any) => {
-                style.startWindowLevel();
-            };
-            (style as any).handleRightButtonRelease = () => {
-                style.endWindowLevel();
-            };
-
-            // 3. 中键: Zoom (原默认是 Pan)
-            (style as any).handleMiddleButtonPress = (_callData: any) => {
                 style.startDolly();
             };
-            (style as any).handleMiddleButtonRelease = () => {
+            (style as any).handleRightButtonRelease = () => {
                 style.endDolly();
+            };
+
+            // 3. 中键: Pan
+            (style as any).handleMiddleButtonPress = (_callData: any) => {
+                style.startPan();
+            };
+            (style as any).handleMiddleButtonRelease = () => {
+                style.endPan();
             };
         } catch (e) {
             console.warn('Failed to rebind keys on vtkInteractorStyleImage:', e);
@@ -185,32 +195,9 @@ class VTKMPRView {
             this.render();
         }).observe(this.container);
 
-        // 跟踪中键状态（用于中键+滚轮=缩放）
-        this.container.addEventListener('mousedown', (e) => {
-            if (e.button === 1) this.isMiddleButtonDown = true;
-        });
-        window.addEventListener('mouseup', (e) => {
-            if (e.button === 1) this.isMiddleButtonDown = false;
-        });
-
         // 鼠标滚轮事件
         this.container.addEventListener('wheel', (e) => {
             e.preventDefault();
-
-            // 中键按住 + 滚轮 = 缩放（平行投影用 parallelScale）
-            if (this.isMiddleButtonDown) {
-                const camera = this.renderer?.getActiveCamera();
-                if (camera) {
-                    const scale = camera.getParallelScale();
-                    // deltaY > 0 = 滚轮下 = 缩小（scale 变大）
-                    const factor = e.deltaY > 0 ? 1.1 : 0.9;
-                    camera.setParallelScale(scale * factor);
-                    this.renderer.resetCameraClippingRange();
-                    this.render();
-                    this.paintOverlay(); // 缩放后刷新 overlay
-                }
-                return;
-            }
 
             // 普通滚轮 = 翻页
             if (!this.imageMapper) return;
@@ -268,97 +255,128 @@ class VTKMPRView {
     }
 
     private ensureOverlayLayer(): void {
-        if (this.overlayCanvas) {
+        if (this.overlayGPUCanvas) {
             return;
         }
-        const canvas = document.createElement('canvas');
-        canvas.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:3;';
-        this.container.appendChild(canvas);
-        this.overlayCanvas = canvas;
-        this.overlayContext = canvas.getContext('2d');
-        this.overlayMaskCanvas = document.createElement('canvas');
-        this.overlayMaskContext = this.overlayMaskCanvas.getContext('2d');
-        this.overlayEdgeCanvas = document.createElement('canvas');
-        this.overlayEdgeContext = this.overlayEdgeCanvas.getContext('2d');
+        const gpuCanvas = document.createElement('canvas');
+        gpuCanvas.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:4;display:block;';
+        this.container.appendChild(gpuCanvas);
+        this.overlayGPUCanvas = gpuCanvas;
+        this.overlayGPURenderer = new GPUSliceOverlayRenderer(gpuCanvas);
+        this.overlayGPURenderer.requestInitialize();
         this.resizeOverlayCanvas();
     }
 
-    // offscreen canvas 额外 padding（CSS 像素），防止缩放后椭圆超出 canvas 被裁剪
-    private static readonly OVERLAY_PAD = 300;
-
     private resizeOverlayCanvas(): void {
-        if (!this.overlayCanvas || !this.overlayMaskCanvas || !this.overlayEdgeCanvas) return;
+        if (!this.overlayGPUCanvas) return;
         const rect = this.container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         const pixelWidth = Math.max(1, Math.floor(rect.width * dpr));
         const pixelHeight = Math.max(1, Math.floor(rect.height * dpr));
-        const pad = VTKMPRView.OVERLAY_PAD;
-        const padPx = Math.ceil(pad * dpr);
-        const paddedW = pixelWidth + 2 * padPx;
-        const paddedH = pixelHeight + 2 * padPx;
-
-        // 可视 overlay canvas = viewport 大小
-        if (this.overlayCanvas.width !== pixelWidth || this.overlayCanvas.height !== pixelHeight) {
-            this.overlayCanvas.width = pixelWidth;
-            this.overlayCanvas.height = pixelHeight;
-            this.overlayCanvas.style.width = `${Math.floor(rect.width)}px`;
-            this.overlayCanvas.style.height = `${Math.floor(rect.height)}px`;
+        let resized = false;
+        if (this.overlayGPUCanvas.width !== pixelWidth || this.overlayGPUCanvas.height !== pixelHeight) {
+            this.overlayGPUCanvas.width = pixelWidth;
+            this.overlayGPUCanvas.height = pixelHeight;
+            resized = true;
         }
-        // offscreen mask/edge canvas = viewport + 2*pad（每边各扩展 pad）
-        if (this.overlayMaskCanvas.width !== paddedW || this.overlayMaskCanvas.height !== paddedH) {
-            this.overlayMaskCanvas.width = paddedW;
-            this.overlayMaskCanvas.height = paddedH;
-        }
-        if (this.overlayEdgeCanvas.width !== paddedW || this.overlayEdgeCanvas.height !== paddedH) {
-            this.overlayEdgeCanvas.width = paddedW;
-            this.overlayEdgeCanvas.height = paddedH;
-        }
-
-        if (this.overlayContext) {
-            this.overlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
-        }
-        if (this.overlayMaskContext) {
-            // 用 translate 把绘制原点偏移到 padding 区域内部，这样 CSS 坐标 (0,0) 对应 canvas 像素 (padPx, padPx)
-            this.overlayMaskContext.setTransform(dpr, 0, 0, dpr, padPx, padPx);
-        }
-        if (this.overlayEdgeContext) {
-            this.overlayEdgeContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.overlayGPUCanvas.style.width = `${Math.floor(rect.width)}px`;
+        this.overlayGPUCanvas.style.height = `${Math.floor(rect.height)}px`;
+        if (resized) {
+            this.resetOverlayRasterCache();
         }
     }
 
-    private clearOverlayCanvas(): void {
-        if (!this.overlayContext) return;
-        const rect = this.container.getBoundingClientRect();
-        this.overlayContext.clearRect(0, 0, rect.width, rect.height);
+    private resetOverlayRasterCache(): void {
+        this.overlayRenderedSliceIndex = null;
+        this.overlayRenderedOpCount = 0;
+        this.overlayRenderedCameraKey = '';
     }
 
-    private paintOverlay(): void {
-        this.clearOverlayCanvas();
-        if (
-            !this.overlayContext
-            || !this.overlayMaskCanvas
-            || !this.overlayMaskContext
-            || !this.overlayEdgeCanvas
-            || !this.overlayEdgeContext
-        ) {
+    private projectOverlayOpsToPixels(
+        ops: Array<{
+            centerMM: [number, number, number];
+            radiusMM: number;
+            erase: boolean;
+        }>,
+        rect: DOMRect,
+        zoomRatio: number,
+        panOffsetX: number,
+        panOffsetY: number
+    ): OverlayProjectedCircle[] {
+        const projectedOps: OverlayProjectedCircle[] = [];
+        for (const op of ops) {
+            const projected = projectOverlayCircle({
+                viewType: this.viewType,
+                centerMM: op.centerMM,
+                radiusMM: op.radiusMM,
+                workspaceSizeMM: WORKSPACE_SIZE_MM,
+            });
+            const radii = computeCircularOverlayPixelRadii({
+                radiusNorm: Math.max(projected.rx, projected.ry),
+                viewportWidth: rect.width,
+                viewportHeight: rect.height,
+                minRadiusPx: 2,
+            });
+
+            const baseCx = projected.cx * rect.width;
+            const baseCy = projected.cy * rect.height;
+            const cx = (baseCx - rect.width / 2) * zoomRatio + rect.width / 2 + panOffsetX;
+            const cy = (baseCy - rect.height / 2) * zoomRatio + rect.height / 2 + panOffsetY;
+            const radiusPx = Math.max(1, Math.max(radii.rxPx, radii.ryPx) * zoomRatio);
+            projectedOps.push({
+                centerPx: [cx, cy],
+                radiusPx,
+                erase: op.erase,
+            });
+        }
+        return projectedOps;
+    }
+
+    private tryPaintOverlayWithGPU(
+        projectedOps: OverlayProjectedCircle[],
+        incremental: boolean,
+        startOperationIndex: number,
+        quality: OverlayRenderQuality
+    ): boolean {
+        const renderer = this.overlayGPURenderer;
+        const gpuCanvas = this.overlayGPUCanvas;
+        if (!renderer || !gpuCanvas) {
+            return false;
+        }
+        renderer.requestInitialize();
+        if (!renderer.isReady()) {
+            return false;
+        }
+        const dpr = window.devicePixelRatio || 1;
+        const gpuOps = projectedOps.map((op) => ({
+            centerPx: [op.centerPx[0] * dpr, op.centerPx[1] * dpr] as [number, number],
+            radiusPx: op.radiusPx * dpr,
+            erase: op.erase,
+        }));
+        const rendered = renderer.render({
+            widthPx: Math.max(1, gpuCanvas.width),
+            heightPx: Math.max(1, gpuCanvas.height),
+            operations: gpuOps,
+            startOperationIndex,
+            incremental,
+            quality,
+        });
+        return rendered;
+    }
+
+    private paintOverlay(quality: OverlayRenderQuality = 'full'): void {
+        if (!this.overlayGPUCanvas || !this.overlayGPURenderer) {
             return;
         }
 
         const rect = this.container.getBoundingClientRect();
-        const ops = this.overlayAccumulator.getSliceOps(this.getSlice());
-        if (ops.length === 0) return;
-
-        const maskCtx = this.overlayMaskContext;
-        const edgeCtx = this.overlayEdgeContext;
-        const mainCtx = this.overlayContext;
-        const pad = VTKMPRView.OVERLAY_PAD;
-
-        // 清除 padded mask canvas
-        maskCtx.save();
-        maskCtx.setTransform(1, 0, 0, 1, 0, 0); // 临时重置变换来 clearRect 整个 canvas
-        maskCtx.clearRect(0, 0, this.overlayMaskCanvas.width, this.overlayMaskCanvas.height);
-        maskCtx.restore();
-        maskCtx.globalCompositeOperation = 'source-over';
+        const sliceIndex = this.getSlice();
+        const ops = this.overlayAccumulator.getSliceOps(sliceIndex);
+        if (ops.length === 0) {
+            this.resetOverlayRasterCache();
+            this.overlayGPURenderer?.clear();
+            return;
+        }
 
         // 计算缩放/平移补偿：让 overlay 跟随 VTK.js 相机变化
         const camera = this.renderer?.getActiveCamera();
@@ -387,195 +405,43 @@ class VTKMPRView {
             }
         }
 
-        // 在 padded canvas 上绘制椭圆（坐标系已被 setTransform 偏移了 pad）
-        for (const op of ops) {
-            const projected = projectOverlayCircle({
-                viewType: this.viewType,
-                centerMM: op.centerMM,
-                radiusMM: op.radiusMM,
-                workspaceSizeMM: WORKSPACE_SIZE_MM,
-            });
-            const radii = computeCircularOverlayPixelRadii({
-                radiusNorm: Math.max(projected.rx, projected.ry),
-                viewportWidth: rect.width,
-                viewportHeight: rect.height,
-                minRadiusPx: 2,
-            });
+        const cameraKey = `${zoomRatio.toFixed(5)}:${panOffsetX.toFixed(2)}:${panOffsetY.toFixed(2)}:${rect.width.toFixed(1)}:${rect.height.toFixed(1)}`;
+        const canIncrementalDraw =
+            this.overlayRenderedSliceIndex === sliceIndex
+            && this.overlayRenderedCameraKey === cameraKey
+            && this.overlayRenderedOpCount >= 0
+            && this.overlayRenderedOpCount <= ops.length;
+        const startOperationIndex = canIncrementalDraw ? this.overlayRenderedOpCount : 0;
+        const projectedOps = this.projectOverlayOpsToPixels(ops, rect, zoomRatio, panOffsetX, panOffsetY);
 
-            const baseCx = projected.cx * rect.width;
-            const baseCy = projected.cy * rect.height;
-            const cx = (baseCx - rect.width / 2) * zoomRatio + rect.width / 2 + panOffsetX;
-            const cy = (baseCy - rect.height / 2) * zoomRatio + rect.height / 2 + panOffsetY;
-            const rx = radii.rxPx * zoomRatio;
-            const ry = radii.ryPx * zoomRatio;
-
-            maskCtx.beginPath();
-            maskCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-            if (op.erase) {
-                maskCtx.globalCompositeOperation = 'destination-out';
-                maskCtx.fillStyle = 'rgba(0,0,0,1)';
-            } else {
-                maskCtx.globalCompositeOperation = 'source-over';
-                maskCtx.fillStyle = 'rgba(255,255,255,1)';
+        if (quality === 'fast') {
+            const gpuRendered = this.tryPaintOverlayWithGPU(
+                projectedOps,
+                canIncrementalDraw,
+                startOperationIndex,
+                quality
+            );
+            if (gpuRendered) {
+                this.overlayRenderedSliceIndex = sliceIndex;
+                this.overlayRenderedCameraKey = cameraKey;
+                this.overlayRenderedOpCount = ops.length;
+                return;
             }
-            maskCtx.fill();
+            return;
         }
-        maskCtx.globalCompositeOperation = 'source-over';
-
-        // 读取完整 padded canvas 数据进行形态学处理
-        const fullW = this.overlayMaskCanvas.width;
-        const fullH = this.overlayMaskCanvas.height;
-        const maskImage = maskCtx.getImageData(0, 0, fullW, fullH);
-        this.binarizeMask(maskImage.data);
-        this.closeMask(maskImage.data, maskImage.width, maskImage.height);
-        maskCtx.putImageData(maskImage, 0, 0);
-
-        const edgeImage = edgeCtx.createImageData(maskImage.width, maskImage.height);
-        this.extractMaskEdges(maskImage.data, edgeImage.data, maskImage.width, maskImage.height);
-        edgeCtx.putImageData(edgeImage, 0, 0);
-
-        // 从 padded canvas 中提取 viewport 区域合成到可视 canvas
-        const dpr = window.devicePixelRatio || 1;
-        const padPx = Math.ceil(pad * dpr);
-        const srcX = padPx;
-        const srcY = padPx;
-        const srcW = Math.max(1, Math.floor(rect.width * dpr));
-        const srcH = Math.max(1, Math.floor(rect.height * dpr));
-
-        // 填充区域
-        mainCtx.save();
-        mainCtx.drawImage(this.overlayMaskCanvas, srcX, srcY, srcW, srcH, 0, 0, rect.width, rect.height);
-        mainCtx.globalCompositeOperation = 'source-in';
-        mainCtx.fillStyle = 'rgba(0, 224, 255, 0.22)';
-        mainCtx.fillRect(0, 0, rect.width, rect.height);
-        mainCtx.restore();
-
-        // 轮廓线
-        mainCtx.save();
-        mainCtx.drawImage(this.overlayEdgeCanvas, srcX, srcY, srcW, srcH, 0, 0, rect.width, rect.height);
-        mainCtx.globalCompositeOperation = 'source-in';
-        mainCtx.fillStyle = 'rgba(0, 224, 255, 0.96)';
-        mainCtx.fillRect(0, 0, rect.width, rect.height);
-        mainCtx.restore();
-    }
-
-    private binarizeMask(data: Uint8ClampedArray): void {
-        for (let i = 0; i < data.length; i += 4) {
-            const on = data[i + 3] >= 32;
-            const v = on ? 255 : 0;
-            data[i] = v;
-            data[i + 1] = v;
-            data[i + 2] = v;
-            data[i + 3] = v;
-        }
-    }
-
-    private closeMask(data: Uint8ClampedArray, width: number, height: number): void {
-        const pixelCount = Math.max(1, width * height);
-        const source = new Uint8Array(pixelCount);
-        for (let i = 0, p = 0; p < pixelCount; p++, i += 4) {
-            source[p] = data[i + 3] > 0 ? 1 : 0;
+        const gpuRendered = this.tryPaintOverlayWithGPU(
+            projectedOps,
+            canIncrementalDraw,
+            startOperationIndex,
+            quality
+        );
+        if (!gpuRendered) {
+            return;
         }
 
-        const dilated = new Uint8Array(pixelCount);
-        const closed = new Uint8Array(pixelCount);
-        this.dilateBinaryMask(source, dilated, width, height);
-        this.erodeBinaryMask(dilated, closed, width, height);
-
-        for (let i = 0, p = 0; p < pixelCount; p++, i += 4) {
-            const v = closed[p] > 0 ? 255 : 0;
-            data[i] = v;
-            data[i + 1] = v;
-            data[i + 2] = v;
-            data[i + 3] = v;
-        }
-    }
-
-    private dilateBinaryMask(src: Uint8Array, dst: Uint8Array, width: number, height: number): void {
-        const isOn = (x: number, y: number): boolean => {
-            if (x < 0 || y < 0 || x >= width || y >= height) {
-                return false;
-            }
-            return src[y * width + x] > 0;
-        };
-
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                let on = false;
-                for (let oy = -1; oy <= 1 && !on; oy++) {
-                    for (let ox = -1; ox <= 1; ox++) {
-                        if (isOn(x + ox, y + oy)) {
-                            on = true;
-                            break;
-                        }
-                    }
-                }
-                dst[y * width + x] = on ? 1 : 0;
-            }
-        }
-    }
-
-    private erodeBinaryMask(src: Uint8Array, dst: Uint8Array, width: number, height: number): void {
-        const isOn = (x: number, y: number): boolean => {
-            // 越界视为 on，避免闭运算在画布边界侵蚀掩膜
-            if (x < 0 || y < 0 || x >= width || y >= height) {
-                return true;
-            }
-            return src[y * width + x] > 0;
-        };
-
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                let on = true;
-                for (let oy = -1; oy <= 1 && on; oy++) {
-                    for (let ox = -1; ox <= 1; ox++) {
-                        if (!isOn(x + ox, y + oy)) {
-                            on = false;
-                            break;
-                        }
-                    }
-                }
-                dst[y * width + x] = on ? 1 : 0;
-            }
-        }
-    }
-
-    private extractMaskEdges(
-        mask: Uint8ClampedArray,
-        out: Uint8ClampedArray,
-        width: number,
-        height: number
-    ): void {
-        const isOn = (x: number, y: number): boolean => {
-            // 越界视为 on，避免在画布边界产生假轮廓
-            if (x < 0 || y < 0 || x >= width || y >= height) return true;
-            return mask[(y * width + x) * 4 + 3] > 0;
-        };
-
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                if (!isOn(x, y)) {
-                    continue;
-                }
-                const edge =
-                    !isOn(x - 1, y)
-                    || !isOn(x + 1, y)
-                    || !isOn(x, y - 1)
-                    || !isOn(x, y + 1)
-                    || !isOn(x - 1, y - 1)
-                    || !isOn(x + 1, y - 1)
-                    || !isOn(x - 1, y + 1)
-                    || !isOn(x + 1, y + 1);
-                if (!edge) {
-                    continue;
-                }
-                const idx = (y * width + x) * 4;
-                out[idx] = 255;
-                out[idx + 1] = 255;
-                out[idx + 2] = 255;
-                out[idx + 3] = 255;
-            }
-        }
+        this.overlayRenderedSliceIndex = sliceIndex;
+        this.overlayRenderedCameraKey = cameraKey;
+        this.overlayRenderedOpCount = ops.length;
     }
 
     setImageData(imageData: any): void {
@@ -687,7 +553,9 @@ class VTKMPRView {
         centerMM: [number, number, number],
         radiusMM: number,
         erase: boolean,
-        sliceIndex = this.getSlice()
+        sliceIndex = this.getSlice(),
+        strokeStart = false,
+        quality: OverlayRenderQuality = 'full'
     ): void {
         this.ensureOverlayLayer();
         this.overlayAccumulator.append({
@@ -695,13 +563,45 @@ class VTKMPRView {
             centerMM: [...centerMM] as [number, number, number],
             radiusMM,
             erase,
+            strokeStart,
         });
-        this.paintOverlay();
+        this.paintOverlay(quality);
+    }
+
+    renderAnnotationOverlayBatch(
+        operations: Array<{
+            centerMM: [number, number, number];
+            radiusMM: number;
+            erase: boolean;
+            sliceIndex: number;
+            strokeStart?: boolean;
+        }>,
+        quality: OverlayRenderQuality = 'full'
+    ): void {
+        if (operations.length === 0) {
+            return;
+        }
+        this.ensureOverlayLayer();
+        for (const operation of operations) {
+            this.overlayAccumulator.append({
+                sliceIndex: operation.sliceIndex,
+                centerMM: [...operation.centerMM] as [number, number, number],
+                radiusMM: operation.radiusMM,
+                erase: operation.erase,
+                strokeStart: operation.strokeStart ?? false,
+            });
+        }
+        this.paintOverlay(quality);
+    }
+
+    refineAnnotationOverlay(): void {
+        this.paintOverlay('full');
     }
 
     clearAnnotationOverlay(): void {
         this.overlayAccumulator.clear();
-        this.clearOverlayCanvas();
+        this.resetOverlayRasterCache();
+        this.overlayGPURenderer?.clear();
     }
 
     private updateWindowLevel(): void {
@@ -973,6 +873,196 @@ let webgpuSessionId = 0;
 let webgpuRecoveryInFlight = false;
 let webgpuRecoveryQueued = false;
 
+interface OverlayHistoryOperation {
+    viewType: ViewType;
+    sliceIndex: number;
+    centerMM: [number, number, number];
+    radiusMM: number;
+    erase: boolean;
+    strokeStart: boolean;
+}
+
+type OverlayHistoryEntry = OverlayHistoryOperation[];
+
+const overlayUndoHistory: OverlayHistoryEntry[] = [];
+const overlayRedoHistory: OverlayHistoryEntry[] = [];
+const pendingOverlayStrokeQueue: OverlayHistoryEntry[] = [];
+let activeOverlayStroke: OverlayHistoryEntry | null = null;
+let suppressOverlaySyncCapture = false;
+
+function cloneOverlayOperation(operation: OverlayHistoryOperation): OverlayHistoryOperation {
+    return {
+        viewType: operation.viewType,
+        sliceIndex: operation.sliceIndex,
+        centerMM: [...operation.centerMM] as [number, number, number],
+        radiusMM: operation.radiusMM,
+        erase: operation.erase,
+        strokeStart: operation.strokeStart,
+    };
+}
+
+function beginLiveOverlayStroke(event: AnnotationStrokeLifecycleEvent): void {
+    const viewType = event.viewType as ViewType;
+    if (activeOverlayStroke && activeOverlayStroke.length > 0 && activeOverlayStroke[0].viewType !== viewType) {
+        activeOverlayStroke = null;
+    }
+    activeOverlayStroke = [];
+}
+
+function appendLiveOverlayStrokeSample(sample: AnnotationStrokeSampleEvent): void {
+    const viewType = sample.viewType as ViewType;
+    const view = views.get(viewType);
+    if (!view) {
+        return;
+    }
+
+    const sliceIndex = view.getSlice();
+    const strokeStart = !activeOverlayStroke || activeOverlayStroke.length === 0;
+    const operation: OverlayHistoryOperation = {
+        viewType,
+        sliceIndex,
+        centerMM: [...sample.centerMM] as [number, number, number],
+        radiusMM: sample.brushRadiusMM,
+        erase: sample.erase,
+        strokeStart,
+    };
+
+    if (!activeOverlayStroke || activeOverlayStroke[0]?.viewType !== viewType) {
+        activeOverlayStroke = [];
+    }
+    activeOverlayStroke.push(operation);
+    view.renderAnnotationOverlay(
+        operation.centerMM,
+        operation.radiusMM,
+        operation.erase,
+        operation.sliceIndex,
+        operation.strokeStart,
+        'fast'
+    );
+}
+
+function finalizeLiveOverlayStroke(event: AnnotationStrokeLifecycleEvent): void {
+    const viewType = event.viewType as ViewType;
+    if (!activeOverlayStroke || activeOverlayStroke.length === 0) {
+        return;
+    }
+    if (activeOverlayStroke[0].viewType !== viewType) {
+        activeOverlayStroke = null;
+        return;
+    }
+
+    const view = views.get(viewType);
+    view?.refineAnnotationOverlay();
+
+    pendingOverlayStrokeQueue.push(activeOverlayStroke.map(cloneOverlayOperation));
+    activeOverlayStroke = null;
+}
+
+function consumePendingOverlayStrokeForPayload(
+    centerMM: [number, number, number],
+    radiusMM: number,
+    erase: boolean
+): OverlayHistoryEntry | null {
+    if (pendingOverlayStrokeQueue.length === 0) {
+        return null;
+    }
+
+    const CENTER_EPSILON_MM = 1;
+    const RADIUS_EPSILON_MM = 0.5;
+    let matchedIndex = -1;
+
+    for (let i = 0; i < pendingOverlayStrokeQueue.length; i++) {
+        const entry = pendingOverlayStrokeQueue[i];
+        if (entry.length === 0) {
+            continue;
+        }
+
+        const tail = entry[entry.length - 1];
+        const dx = tail.centerMM[0] - centerMM[0];
+        const dy = tail.centerMM[1] - centerMM[1];
+        const dz = tail.centerMM[2] - centerMM[2];
+        const centerDistance = Math.hypot(dx, dy, dz);
+        const radiusDelta = Math.abs(tail.radiusMM - radiusMM);
+        const matches =
+            tail.erase === erase
+            && centerDistance <= CENTER_EPSILON_MM
+            && radiusDelta <= RADIUS_EPSILON_MM;
+        if (matches) {
+            matchedIndex = i;
+            break;
+        }
+    }
+
+    if (matchedIndex < 0) {
+        return null;
+    }
+
+    if (matchedIndex > 0) {
+        pendingOverlayStrokeQueue.splice(0, matchedIndex);
+    }
+    return pendingOverlayStrokeQueue.shift() ?? null;
+}
+
+function projectPendingStrokeToView(
+    source: OverlayHistoryEntry,
+    targetViewType: ViewType,
+    targetSliceIndex: number
+): OverlayHistoryEntry {
+    const projected: OverlayHistoryEntry = [];
+    for (const operation of source) {
+        projected.push({
+            viewType: targetViewType,
+            sliceIndex: targetSliceIndex,
+            centerMM: [...operation.centerMM] as [number, number, number],
+            radiusMM: operation.radiusMM,
+            erase: operation.erase,
+            strokeStart: operation.strokeStart,
+        });
+    }
+    return projected;
+}
+
+function clearAllAnnotationOverlays(): void {
+    for (const view of views.values()) {
+        view.clearAnnotationOverlay();
+    }
+}
+
+function replayOverlayHistory(): void {
+    clearAllAnnotationOverlays();
+    for (const entry of overlayUndoHistory) {
+        for (const op of entry) {
+            const view = views.get(op.viewType);
+            if (!view) {
+                continue;
+            }
+            view.renderAnnotationOverlay(op.centerMM, op.radiusMM, op.erase, op.sliceIndex, op.strokeStart);
+        }
+    }
+}
+
+function trimOverlayHistoryToEngineDepth(): void {
+    const snapshot = annotationRuntime?.engine.getHistorySnapshot();
+    if (!snapshot) {
+        return;
+    }
+
+    if (overlayUndoHistory.length > snapshot.undoDepth) {
+        overlayUndoHistory.splice(0, overlayUndoHistory.length - snapshot.undoDepth);
+    }
+    if (overlayRedoHistory.length > snapshot.redoDepth) {
+        overlayRedoHistory.splice(0, overlayRedoHistory.length - snapshot.redoDepth);
+    }
+}
+
+function resetOverlayHistory(): void {
+    overlayUndoHistory.length = 0;
+    overlayRedoHistory.length = 0;
+    pendingOverlayStrokeQueue.length = 0;
+    activeOverlayStroke = null;
+    clearAllAnnotationOverlays();
+}
+
 function updateHistoryControlsState(): void {
     const undoBtn = document.getElementById('annotation-undo') as HTMLButtonElement | null;
     const redoBtn = document.getElementById('annotation-redo') as HTMLButtonElement | null;
@@ -1094,6 +1184,9 @@ function updateAnnotationStatus(status: AnnotationStatus): void {
     }
 
     line.textContent = `勾画状态: ${status.phase} | ROI ${status.roiId} | dirty ${status.pendingDirtyBricks}`;
+    if (!suppressOverlaySyncCapture) {
+        trimOverlayHistoryToEngineDepth();
+    }
     updateHistoryStatus();
     updateHistoryControlsState();
     updatePerformanceStatus();
@@ -1220,6 +1313,7 @@ async function initializeWebGPUView(): Promise<void> {
         annotationControllers = [];
         annotationRuntime?.destroy();
         annotationRuntime = null;
+        resetOverlayHistory();
         annotationPerformanceTracker.reset();
         updateHistoryControlsState();
         updateHistoryStatus();
@@ -1276,7 +1370,10 @@ async function initializeWebGPUView(): Promise<void> {
             const controller = new AnnotationInteractionController(interactionTarget, annotationRuntime.engine, {
                 viewType,
                 requireCtrlKey: false,
-                triggerButton: 2,
+                triggerButton: 0,
+                onStrokeStart: beginLiveOverlayStroke,
+                onStrokeSample: appendLiveOverlayStrokeSample,
+                onStrokeEnd: finalizeLiveOverlayStroke,
             });
             controller.attach();
             annotationControllers.push(controller);
@@ -1340,11 +1437,53 @@ function setupEventBusIntegration(): void {
     });
 
     eventBus.on('slice:sync', (payload) => {
+        const overlayEntry: OverlayHistoryEntry = [];
+        const pendingSourceStroke = suppressOverlaySyncCapture
+            ? null
+            : consumePendingOverlayStrokeForPayload(
+                [...payload.centerMM] as [number, number, number],
+                payload.brushRadiusMM,
+                payload.erase
+            );
+        const pendingSourceViewType = pendingSourceStroke?.[0]?.viewType;
         for (const target of payload.targets) {
             const view = views.get(target.viewType);
             if (!view) continue;
+
+            if (suppressOverlaySyncCapture) {
+                continue;
+            }
+
+            if (pendingSourceStroke) {
+                const targetSliceIndex = view.getSlice();
+                const projectedStroke = pendingSourceViewType === target.viewType
+                    ? pendingSourceStroke.map(cloneOverlayOperation)
+                    : projectPendingStrokeToView(
+                        pendingSourceStroke,
+                        target.viewType as ViewType,
+                        targetSliceIndex
+                    );
+
+                view.renderAnnotationOverlayBatch(projectedStroke);
+                overlayEntry.push(...projectedStroke);
+                continue;
+            }
+
+            const sliceIndex = view.getSlice();
             // 不改变视图切片，在各视图的当前切片上渲染 overlay
-            view.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, view.getSlice());
+            view.renderAnnotationOverlay(payload.centerMM, payload.brushRadiusMM, payload.erase, sliceIndex, true);
+            overlayEntry.push({
+                viewType: target.viewType as ViewType,
+                sliceIndex,
+                centerMM: [...payload.centerMM] as [number, number, number],
+                radiusMM: payload.brushRadiusMM,
+                erase: payload.erase,
+                strokeStart: true,
+            });
+        }
+        if (!suppressOverlaySyncCapture && overlayEntry.length > 0) {
+            overlayUndoHistory.push(overlayEntry);
+            overlayRedoHistory.length = 0;
         }
 
         annotationPerformanceTracker.recordDiagnostics({
@@ -1431,11 +1570,22 @@ function setupROIControls(): void {
         if (!annotationRuntime) {
             return;
         }
-        // 先清除所有视图的 overlay，避免 undo 后残留痕迹
-        for (const view of views.values()) {
-            view.clearAnnotationOverlay();
+        let didUndo = false;
+        suppressOverlaySyncCapture = true;
+        try {
+            const result = await annotationRuntime.engine.undoLast();
+            didUndo = result !== null;
+        } finally {
+            suppressOverlaySyncCapture = false;
         }
-        await annotationRuntime.engine.undoLast();
+        if (didUndo) {
+            const entry = overlayUndoHistory.pop();
+            if (entry) {
+                overlayRedoHistory.push(entry);
+            }
+            trimOverlayHistoryToEngineDepth();
+            replayOverlayHistory();
+        }
         updateHistoryStatus();
         updateHistoryControlsState();
     };
@@ -1444,11 +1594,22 @@ function setupROIControls(): void {
         if (!annotationRuntime) {
             return;
         }
-        // 先清除所有视图的 overlay，避免 redo 后残留痕迹
-        for (const view of views.values()) {
-            view.clearAnnotationOverlay();
+        let didRedo = false;
+        suppressOverlaySyncCapture = true;
+        try {
+            const result = await annotationRuntime.engine.redoLast();
+            didRedo = result !== null;
+        } finally {
+            suppressOverlaySyncCapture = false;
         }
-        await annotationRuntime.engine.redoLast();
+        if (didRedo) {
+            const entry = overlayRedoHistory.pop();
+            if (entry) {
+                overlayUndoHistory.push(entry);
+            }
+            trimOverlayHistoryToEngineDepth();
+            replayOverlayHistory();
+        }
         updateHistoryStatus();
         updateHistoryControlsState();
     };
@@ -1657,4 +1818,3 @@ function setupWindowLevelControls(): void {
 
 // 启动
 document.addEventListener('DOMContentLoaded', initializeApp);
-

@@ -1,4 +1,4 @@
-# AGNENTS.md
+# AGENTS.md
 
 本文件为本仓库中工作时提供指导。
 
@@ -30,7 +30,7 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 
 #### MPR 视图（VTK.js，保留）
 
-- **`src/main.ts`**（约 600 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、鼠标交互（滚轮=切片，右键=窗宽窗位），并通过 `initializeApp()` 完成应用初始化。
+- **`src/main.ts`**（约 1800 行）：主入口文件。包含 `VTKMPRView` 类，负责管理 3 个 MPR 视图、DICOM 加载、overlay 渲染与勾画交互桥接（右键勾画），并通过 `initializeApp()` 完成应用初始化。
 
 - **`src/loaders/`**：DICOM（基于 dcmjs）与 NIfTI 加载器，并统一抽象为 `VolumeData`。
 
@@ -53,6 +53,8 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - **`src/gpu/pipelines/BasicRenderPipeline.ts`**：WebGPU 渲染管线。BindGroup 管理、Uniform 更新、深度缓冲配置。
 
 - **`src/gpu/WebGPURenderer.ts`**：WebGPU 渲染器。Canvas 管理、轨迹球相机、网格上传、渲染循环。
+
+- **`src/gpu/annotation/GPUSliceOverlayRenderer.ts`**：切面 overlay 的 GPU 渲染器。包含笔刷 mask 写入、GPU morphology（dilate+erode）与轮廓/填充合成。
 
 - **`src/gpu/shaders/*.wgsl`**：WGSL 着色器。`basic_render.wgsl`（顶点+片段）、`structs.wgsl`（数据结构）、`vertexq_utils.wgsl`（工具函数）。
 
@@ -98,12 +100,13 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - Phase 13 集成测试与端到端实机验证已完成（Chrome 144 + RTX 4000 Ada）
 - 详见：`doc/archive/webgpu-phase11-13-completion.md`
 - 补充：`doc/archive/webgpu-phase11-13-followup-2026-02-11.md`（右键交互/union 跟进）
+- 补充：`doc/archive/webgpu-cpu overlaytogpu overlay.md`（CPU overlay -> GPU overlay 迁移归档）
 
 完整任务清单见 `doc/task.md`。
 
 ## 架构文档
 
-- **`doc/仿 RayStation 勾画架构文档 2.4.md`**：WebGPU 架构设计文档（367 行）。定义了 Fail-Fast 初始化、VertexQ 量化、SDF Bricks、Subgroup 主路径、性能目标等核心设计。
+- **`doc/仿 RayStation 勾画架构文档 2.4.md`**：WebGPU 架构设计文档（413 行）。定义了 Fail-Fast 初始化、VertexQ 量化、SDF Bricks、Subgroup 主路径、性能目标与 Overlay CPU->GPU 迁移补充。
 
 ## 归档文档
 
@@ -115,6 +118,7 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - **`doc/archive/webgpu-phase9-10-completion.md`**：WebGPU 里程碑 3 完成归档
 - **`doc/archive/webgpu-phase11-13-completion.md`**：WebGPU 里程碑 4 完成归档
 - **`doc/archive/webgpu-phase11-13-followup-2026-02-11.md`**：WebGPU 里程碑 4 补充归档（交互与 union 跟进）
+- **`doc/archive/webgpu-cpu overlaytogpu overlay.md`**：CPU overlay 到 GPU overlay 迁移归档（GPU-only，无 fallback）
 
 
 ## 备注
@@ -123,4 +127,4 @@ DICOM 文件（public/dcmtest/） -> dcmjs 解析器 -> VolumeData
 - MPR 视图需要 WebGL 2.0 支持
 - WebGPU 勾画系统需要 Chrome 136+ 并支持 `subgroups` 和 `shader-f16`
 - 已启用 TypeScript 严格模式；不允许未使用的局部变量/参数
-- 当前 WebGPU 系统仅渲染测试立方体，尚未接入实际 ROI 勾画交互
+- 当前 2D ROI 勾画 overlay 已接入并运行在 GPU 管线；3D 体渲染侧仍保留测试立方体基线

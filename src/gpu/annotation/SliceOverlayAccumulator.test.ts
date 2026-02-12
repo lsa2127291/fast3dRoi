@@ -71,4 +71,31 @@ describe('SliceOverlayAccumulator', () => {
         expect(ops[ops.length - 1].centerMM[0]).toBe(20);
         expect(ops.some((op) => op.centerMM[0] > 0 && op.centerMM[0] < 20)).toBe(true);
     });
+
+    it('should not interpolate across stroke boundaries on same slice', () => {
+        const acc = new SliceOverlayAccumulator({
+            samplingStepFactor: 0.5,
+            maxInterpolationSamples: 64,
+        });
+
+        acc.append({
+            sliceIndex: 9,
+            centerMM: [0, 0, 0],
+            radiusMM: 4,
+            erase: false,
+            strokeStart: true,
+        });
+        acc.append({
+            sliceIndex: 9,
+            centerMM: [20, 0, 0],
+            radiusMM: 4,
+            erase: false,
+            strokeStart: true,
+        });
+
+        const ops = acc.getSliceOps(9);
+        expect(ops).toHaveLength(2);
+        expect(ops[0].centerMM[0]).toBe(0);
+        expect(ops[1].centerMM[0]).toBe(20);
+    });
 });

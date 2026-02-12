@@ -364,3 +364,50 @@ if (hit.valid) {
 3. 带宽收益主要落在切面/顶点相关 pass，端到端收益取决于 SDF/Boolean 占比。
 4. 在“总范围 3m + 步长 0.1mm”约束下，`Int16` 量化满足精度目标。
 5. 只要严格执行 `quantOverflow -> 重定位/重跑`，可维持正确性与可解释性。
+
+---
+
+## 12. Overlay CPU->GPU 迁移补充（2026-02-12）
+
+本节补充 2D 切面 overlay 从 CPU 栅格链路迁移到 WebGPU 的实现约束与结果。
+
+### 12.1 迁移目标
+
+1. 去除 CPU 热路径中的 `getImageData/putImageData`。
+2. 形态学闭运算（dilate + erode）迁移到 GPU pass。
+3. 运行时不保留 fallback，采用 GPU-only overlay。
+
+### 12.2 GPU Overlay 管线
+
+新增 `src/gpu/annotation/GPUSliceOverlayRenderer.ts`，采用 ping-pong 纹理与三阶段渲染：
+
+1. `apply mask pass`：将笔刷操作（圆刷 union/erase）增量写入 mask。
+2. `morphology close pass`（full 质量）：先膨胀后腐蚀，修复细缝与连通性。
+3. `composite pass`：从 mask 生成填充与轮廓并输出到 overlay canvas。
+
+关键一致性约束（对齐旧 CPU 视觉）：
+
+1. 轮廓判定改为 `8 邻域`。
+2. 邻域越界视为 `on`，避免边缘伪轮廓。
+3. 输出使用预乘 alpha，匹配 `alphaMode: premultiplied`。
+
+### 12.3 交互与稳定性补丁
+
+为避免长线串接与异常拉伸，交互层增加两条硬规则：
+
+1. `mouseup` 不追加新采样，提交点使用最后一个有效采样点。
+2. 拖拽过程中超出视图范围的 `mousemove` 采样丢弃。
+
+### 12.4 集成状态
+
+`src/main.ts` 中 overlay 层已切换为 GPU-only：
+
+1. 保留 `overlayGPUCanvas` + `GPUSliceOverlayRenderer`。
+2. 移除 CPU mask/edge/offscreen canvas 与 CPU morphology 代码路径。
+3. `fast/full` 双质量模式保留：`move` 优先 `fast`，提交后可 `full` 精化。
+
+### 12.5 验证结论
+
+1. 构建通过：`npm run build`。
+2. 测试通过：`npm run test -- --run`。
+3. 浏览器实测通过：连续多笔、`mouseup` 后再 `mousedown`、视图外释放等场景可用。

@@ -2,12 +2,26 @@ import { WORKSPACE_SIZE_MM } from '../constants';
 import type { AnnotationEngine } from './AnnotationEngine';
 import type { MPRViewType, Vec3MM } from './types';
 
+export interface AnnotationStrokeLifecycleEvent {
+    viewType: MPRViewType;
+}
+
+export interface AnnotationStrokeSampleEvent extends AnnotationStrokeLifecycleEvent {
+    centerMM: Vec3MM;
+    brushRadiusMM: number;
+    erase: boolean;
+}
+
 export interface AnnotationInteractionControllerOptions {
     viewType?: MPRViewType;
     requireCtrlKey?: boolean;
     triggerButton?: 0 | 1 | 2;
     suppressContextMenu?: boolean;
     captureEvents?: boolean;
+    screenToWorld?: (event: MouseEvent, viewType: MPRViewType, targetElement: HTMLElement) => Vec3MM;
+    onStrokeStart?: (event: AnnotationStrokeLifecycleEvent) => void;
+    onStrokeSample?: (event: AnnotationStrokeSampleEvent) => void;
+    onStrokeEnd?: (event: AnnotationStrokeLifecycleEvent) => void;
 }
 
 export class AnnotationInteractionController {
@@ -16,7 +30,16 @@ export class AnnotationInteractionController {
     private readonly triggerButton: 0 | 1 | 2;
     private readonly suppressContextMenu: boolean;
     private readonly captureEvents: boolean;
+    private readonly customScreenToWorld?: (
+        event: MouseEvent,
+        viewType: MPRViewType,
+        targetElement: HTMLElement
+    ) => Vec3MM;
+    private readonly onStrokeStart?: (event: AnnotationStrokeLifecycleEvent) => void;
+    private readonly onStrokeSample?: (event: AnnotationStrokeSampleEvent) => void;
+    private readonly onStrokeEnd?: (event: AnnotationStrokeLifecycleEvent) => void;
     private isDrawing = false;
+    private lastStrokeSampleWorld: Vec3MM | null = null;
 
     private readonly onMouseDown = (event: MouseEvent): void => {
         if (event.button !== this.triggerButton) {
@@ -28,18 +51,26 @@ export class AnnotationInteractionController {
         event.preventDefault();
         event.stopPropagation();
         this.isDrawing = true;
+        this.onStrokeStart?.({ viewType: this.viewType });
         const world = this.screenToWorld(event);
+        this.lastStrokeSampleWorld = [...world] as Vec3MM;
         void this.engine.previewStroke(world, this.viewType);
+        this.emitStrokeSample(world);
     };
 
     private readonly onMouseMove = (event: MouseEvent): void => {
         if (!this.isDrawing) {
             return;
         }
+        if (!this.isEventInsideTarget(event)) {
+            return;
+        }
         event.preventDefault();
         event.stopPropagation();
         const world = this.screenToWorld(event);
+        this.lastStrokeSampleWorld = [...world] as Vec3MM;
         void this.engine.previewStroke(world, this.viewType);
+        this.emitStrokeSample(world);
     };
 
     private readonly onMouseUp = (event: MouseEvent): void => {
@@ -51,8 +82,12 @@ export class AnnotationInteractionController {
         }
         event.preventDefault();
         event.stopPropagation();
+        const world = this.lastStrokeSampleWorld
+            ? [...this.lastStrokeSampleWorld] as Vec3MM
+            : this.screenToWorld(event);
         this.isDrawing = false;
-        const world = this.screenToWorld(event);
+        this.lastStrokeSampleWorld = null;
+        this.onStrokeEnd?.({ viewType: this.viewType });
         void this.engine.commitStroke(world, this.viewType);
     };
 
@@ -72,6 +107,10 @@ export class AnnotationInteractionController {
         this.triggerButton = options.triggerButton ?? 2;
         this.suppressContextMenu = options.suppressContextMenu ?? true;
         this.captureEvents = options.captureEvents ?? true;
+        this.customScreenToWorld = options.screenToWorld;
+        this.onStrokeStart = options.onStrokeStart;
+        this.onStrokeSample = options.onStrokeSample;
+        this.onStrokeEnd = options.onStrokeEnd;
     }
 
     attach(): void {
@@ -87,9 +126,14 @@ export class AnnotationInteractionController {
         this.targetElement.removeEventListener('contextmenu', this.onContextMenu, { capture: this.captureEvents });
         window.removeEventListener('mouseup', this.onMouseUp);
         this.isDrawing = false;
+        this.lastStrokeSampleWorld = null;
     }
 
     private screenToWorld(event: MouseEvent): Vec3MM {
+        if (this.customScreenToWorld) {
+            return this.customScreenToWorld(event, this.viewType, this.targetElement);
+        }
+
         const rect = this.targetElement.getBoundingClientRect();
         const width = Math.max(1, rect.width);
         const height = Math.max(1, rect.height);
@@ -108,5 +152,31 @@ export class AnnotationInteractionController {
             case 'coronal':  // Y 切面：屏幕 X/Y → 世界 X/Z
                 return [screenX, 0, screenY];
         }
+    }
+
+    private emitStrokeSample(centerMM: Vec3MM): void {
+        if (!this.onStrokeSample) {
+            return;
+        }
+
+        this.onStrokeSample({
+            viewType: this.viewType,
+            centerMM: [...centerMM] as Vec3MM,
+            brushRadiusMM: this.engine.getBrushRadius(),
+            erase: this.engine.getEraseMode(),
+        });
+    }
+
+    private isEventInsideTarget(event: MouseEvent): boolean {
+        const rect = this.targetElement.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return true;
+        }
+        return (
+            event.clientX >= rect.left
+            && event.clientX <= rect.right
+            && event.clientY >= rect.top
+            && event.clientY <= rect.bottom
+        );
     }
 }

@@ -5,6 +5,7 @@ export interface OverlayStrokeOperation {
     centerMM: Vec3MM;
     radiusMM: number;
     erase: boolean;
+    strokeStart?: boolean;
 }
 
 export interface SliceOverlayAccumulatorOptions {
@@ -25,6 +26,7 @@ function cloneOperation(op: OverlayStrokeOperation): OverlayStrokeOperation {
         centerMM: [...op.centerMM] as Vec3MM,
         radiusMM: op.radiusMM,
         erase: op.erase,
+        strokeStart: op.strokeStart ?? false,
     };
 }
 
@@ -78,7 +80,7 @@ export class SliceOverlayAccumulator {
         previous: OverlayStrokeOperation | undefined,
         next: OverlayStrokeOperation
     ): void {
-        if (!previous || previous.erase !== next.erase) {
+        if (!previous || previous.erase !== next.erase || next.strokeStart) {
             bucket.push(next);
             return;
         }

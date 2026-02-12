@@ -232,6 +232,76 @@ describe('AnnotationEngine two-stage workflow', () => {
         expect(onViewSync.mock.calls[2][0].totalLineCount).toBe(3);
     });
 
+    it('should keep previous overlapping contribution after undoing latest stroke', async () => {
+        const onViewSync = vi.fn();
+        const engine = new AnnotationEngine({
+            onViewSync,
+            estimateDirtyBricks: () => ['0_0_0'],
+            sdfPipeline: {
+                previewStroke: async () => undefined,
+                applyStroke: async () => undefined,
+            },
+            marchingCubes: {
+                dispatchWithRetry: async () => ({
+                    overflow: 0,
+                    quantOverflow: 0,
+                    vertexCount: 3,
+                    indexCount: 3,
+                    attempts: 1,
+                }),
+            },
+            slicePipeline: {
+                extractSlices: async ({ roiId, dirtyBrickKeys, targets }) => {
+                    const lineCountPerView = dirtyBrickKeys.length;
+                    return {
+                        roiId,
+                        budget: 128,
+                        budgetHit: false,
+                        totalLineCount: lineCountPerView * 3,
+                        totalDeferredLines: 0,
+                        overflow: 0,
+                        quantOverflow: 0,
+                        viewResults: {
+                            axial: {
+                                viewType: 'axial',
+                                sliceIndex: targets.find((target) => target.viewType === 'axial')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                            sagittal: {
+                                viewType: 'sagittal',
+                                sliceIndex: targets.find((target) => target.viewType === 'sagittal')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                            coronal: {
+                                viewType: 'coronal',
+                                sliceIndex: targets.find((target) => target.viewType === 'coronal')?.sliceIndex ?? 0,
+                                lineCount: lineCountPerView,
+                                deferredLines: 0,
+                                overflow: 0,
+                                quantOverflow: 0,
+                            },
+                        },
+                    };
+                },
+            },
+        });
+
+        await engine.commitStroke([5, 0, 0], 'axial');
+        await engine.commitStroke([5, 0, 0], 'axial');
+        await engine.undoLast();
+
+        expect(onViewSync).toHaveBeenCalledTimes(3);
+        expect(onViewSync.mock.calls[0][0].totalLineCount).toBe(3);
+        expect(onViewSync.mock.calls[1][0].totalLineCount).toBe(3);
+        expect(onViewSync.mock.calls[2][0].totalLineCount).toBe(3);
+    });
+
     it('should support undo and redo with operation history', async () => {
         const applyEraseFlags: boolean[] = [];
         const engine = new AnnotationEngine({
